@@ -5,7 +5,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
-from .vlm import chat, encode_image, resolve_model
+from .vlm import chat, encode_image, resolve_model, warn_inline_key
 
 OUTPUT_RULES = ("Write for MOSS-Image, a text-to-image model with an LLM text encoder that follows long, precise natural language. "
                 "Output only the final prompt: one paragraph of plain natural language, no title, preamble, lists, markdown, tags or commentary. "
@@ -50,7 +50,7 @@ class EZMOSSPromptWriter(io.ComfyNode):
                 io.String.Input("base_url", default="http://127.0.0.1:1234/v1",
                                 tooltip="OpenAI-compatible API root. LM Studio: http://127.0.0.1:1234/v1, Ollama: http://127.0.0.1:11434/v1, llama.cpp: http://127.0.0.1:8080/v1"),
                 io.String.Input("model", default="", tooltip="Model id. Use the 'list models' button to pick one, empty uses the first model the server lists. Needs a vision model when images are connected."),
-                io.String.Input("api_key", default="", tooltip="Leave empty to use the OPENAI_API_KEY environment variable. A key typed here is saved in the workflow and image metadata."),
+                io.String.Input("api_key", default="", tooltip="Leave empty. Use the 'set API key' button to save the key for this base_url outside the workflow. A key typed here is moved there automatically, otherwise OPENAI_API_KEY is used."),
                 io.Combo.Input("preset", options=list(PRESETS), default="enhance prompt"),
                 io.String.Input("system_prompt", multiline=True, default="", tooltip="Replaces the preset's instructions when not empty."),
                 io.String.Input("extra_instructions", multiline=True, default="",
@@ -68,6 +68,7 @@ class EZMOSSPromptWriter(io.ComfyNode):
     @classmethod
     async def execute(cls, prompt, base_url, model, api_key, preset, system_prompt, extra_instructions, max_image_size, max_tokens, temperature, timeout, seed,
                       images: io.Autogrow.Type = None) -> io.NodeOutput:
+        warn_inline_key(api_key, "[EZ Prompt Writer]")
         if preset not in PRESETS:
             raise ValueError(f"Unknown preset {preset}")
         system = (system_prompt.strip() or PRESETS[preset] + "\n\n" + OUTPUT_RULES)

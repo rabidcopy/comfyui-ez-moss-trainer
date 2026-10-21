@@ -22,9 +22,18 @@ Captions every image in a folder (subfolders included) with a vision LLM served 
 - Existing captions are kept unless `overwrite` is on. `<think>` blocks, "Here is a caption:" preambles and leaked chat template markers (a caption starting with "model model ...") are stripped. A reply with nothing left is counted as failed and writes no `.txt`.
 - `max_tokens` defaults to 2048 because thinking models spend tokens reasoning before the caption. A reply cut off at `max_tokens` with no caption fails right away with a hint to raise it.
 - Temporary failures (HTTP 408/429/5xx, timeouts, connection errors, empty replies) are retried up to 3 times with 2/4/8 s backoff, or the server's `Retry-After`. Other errors such as 400 or 401 fail right away. Running the node again only captions images that still have no `.txt`.
-- Leave `api_key` empty to use the `OPENAI_API_KEY` environment variable. A key typed in the node is saved in the workflow.
+- API keys: see [API keys](#api-keys).
 
 Connect its `folder` output to the trainer's `dataset_paths` input to caption and train in one run. Changed captions are re-encoded automatically.
+
+### API keys
+
+Keys never need to be in a workflow. Anything typed into a widget is saved in the workflow file and in the metadata of every image you generate, so a shared PNG would leak it.
+
+- Click **set API key** on the captioner or the prompt writer, paste the key into the masked field and press Enter. It is saved per `base_url` in `ComfyUI/user/ez_moss_api_keys.json`, outside workflows, image metadata and this repo. The button reads "API key saved for this URL" once a key is stored. Save an empty key to remove it.
+- You can also edit that file directly: `{"https://nano-gpt.com/api/v1": "sk-..."}`. The URL is matched without a trailing slash and ignoring case.
+- Lookup order: the `api_key` field, then the saved key for the `base_url`, then the `OPENAI_API_KEY` environment variable.
+- A key found in the `api_key` field, from an older workflow or typed in, is moved to the file automatically and the field is cleared. Save the workflow again afterwards so the old copy is gone from it. Images generated before the move still contain the key in their metadata. If any of them were shared, rotate the key at your provider.
 
 ## EZ MOSS Prompt Writer
 

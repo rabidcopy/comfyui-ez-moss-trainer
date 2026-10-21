@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import io as pyio
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ from aiohttp import web
 from PIL import Image
 
 import comfy.model_management
+import folder_paths
 from server import PromptServer
 
 RETRIES = 3
@@ -23,13 +25,50 @@ class TransientError(Exception):
     pass
 
 
-def _headers(api_key):
-    key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+def keys_file():
+    # in ComfyUI's user folder: outside workflows, image metadata and this repo
+    return os.path.join(folder_paths.get_user_directory(), "ez_moss_api_keys.json")
+
+
+def _endpoint(base_url):
+    return base_url.strip().rstrip("/").lower()
+
+
+def load_keys():
+    try:
+        with open(keys_file(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_key(base_url, api_key):
+    keys = load_keys()
+    if api_key.strip():
+        keys[_endpoint(base_url)] = api_key.strip()
+    else:
+        keys.pop(_endpoint(base_url), None)
+    os.makedirs(os.path.dirname(keys_file()), exist_ok=True)
+    tmp = keys_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(keys, f, indent=2)
+    os.replace(tmp, keys_file())
+
+
+def warn_inline_key(api_key, log_prefix):
+    if api_key.strip():
+        logging.warning(f"{log_prefix} api_key is filled in on the node, so it is saved in the workflow and in image metadata. "
+                        f"Use the 'set API key' button to keep it in {keys_file()} instead.")
+
+
+def _headers(base_url, api_key):
+    """The node's api_key, else the key saved for this base_url, else OPENAI_API_KEY."""
+    key = api_key.strip() or load_keys().get(_endpoint(base_url)) or os.environ.get("OPENAI_API_KEY", "")
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 async def list_models(session, base_url, api_key):
-    async with session.get(base_url.rstrip("/") + "/models", headers=_headers(api_key)) as r:
+    async with session.get(base_url.rstrip("/") + "/models", headers=_headers(base_url, api_key)) as r:
         r.raise_for_status()
         data = await r.json()
     return [m["id"] for m in data.get("data", [])]
@@ -72,7 +111,7 @@ async def chat(session, base_url, api_key, payload, label, log_prefix):
         comfy.model_management.throw_exception_if_processing_interrupted()
         retry_after = None
         try:
-            async with session.post(url, json=payload, headers=_headers(api_key)) as r:
+            async with session.post(url, json=payload, headers=_headers(base_url, api_key)) as r:
                 if r.status != 200:
                     if r.status in RETRY_STATUS:
                         retry_after = r.headers.get("Retry-After")
@@ -108,3 +147,14 @@ async def caption_models_route(request):
             return web.json_response({"models": sorted(await list_models(session, body.get("base_url", ""), body.get("api_key", "")))})
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as e:
         return web.json_response({"error": str(e) or type(e).__name__}, status=502)
+
+
+@PromptServer.instance.routes.post("/ez_moss/api_key")
+async def api_key_route(request):
+    """Saves (or with an empty key removes) the key for a base_url. Keys are never sent back to the browser."""
+    body = await request.json()
+    if not body.get("base_url", "").strip():
+        return web.json_response({"error": "base_url is empty"}, status=400)
+    if "api_key" in body:
+        save_key(body["base_url"], body["api_key"])
+    return web.json_response({"saved": _endpoint(body["base_url"]) in load_keys(), "file": keys_file()})
