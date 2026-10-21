@@ -104,16 +104,20 @@ def encode_text(clip, caption):
     return clip.encode_from_tokens(tokens)[0].to(torch.bfloat16).cpu().contiguous()
 
 
+def text_path(cache, caption):
+    return os.path.join(cache, "text", _key(caption) + ".safetensors")
+
+
 def cached_cond(clip, caption, cache_root, folder):
-    path = os.path.join(_cache_dir(folder, cache_root), "text", _key(caption) + ".safetensors")
+    path = text_path(_cache_dir(folder, cache_root), caption)
     if not os.path.isfile(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         safetensors.torch.save_file({"cond": encode_text(clip, caption)}, path)
     return safetensors.torch.load_file(path)["cond"]
 
 
-def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root):
-    """Scan the folders, assign buckets and fill the latent / text caches. Returns the items and the empty prompt."""
+def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, encode_captions=True):
+    """Scan the folders, assign buckets and fill the latent / text caches. encode_captions off leaves the .txt captions unencoded."""
     buckets = make_buckets(resolution, bucketing)
     items = []
     for folder, repeats in folders:
@@ -128,8 +132,9 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
                 w, h = ImageOps.exif_transpose(img).size
             item["bucket"] = closest_bucket(w, h, buckets)
             item["repeats"] = repeats
+            item["cache"] = cache
             item["latent_path"] = os.path.join(cache, "latents", _key(item["image"], st.st_mtime_ns, st.st_size, *item["bucket"]) + ".safetensors")
-            item["text_path"] = os.path.join(cache, "text", _key(item["caption"]) + ".safetensors")
+            item["text_path"] = text_path(cache, item["caption"])
         items += found
     if not items:
         raise ValueError("The dataset folders contain no images.")
@@ -146,7 +151,7 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
             if (n + 1) % 25 == 0:
                 logging.info(f"[MOSS Trainer]   latents {n + 1}/{len(todo)}")
 
-    todo = {i["text_path"]: i["caption"] for i in items if not os.path.isfile(i["text_path"])}
+    todo = {i["text_path"]: i["caption"] for i in items if encode_captions and not os.path.isfile(i["text_path"])}
     if todo:
         logging.info(f"[MOSS Trainer] Caching {len(todo)} text encodings")
         pbar = comfy.utils.ProgressBar(len(todo))
@@ -159,7 +164,8 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
 
     for item in items:
         item["latent"] = safetensors.torch.load_file(item["latent_path"])["latent"]
-        item["cond"] = safetensors.torch.load_file(item["text_path"])["cond"]
+        if encode_captions:
+            item["cond"] = safetensors.torch.load_file(item["text_path"])["cond"]
 
     counts = {}
     for item in items:

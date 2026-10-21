@@ -89,6 +89,16 @@ The training loss swings a lot from step to step because every step uses a rando
 
 A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`.
 
+## Reference adapter
+
+`reference_training` trains an adapter that takes a character's look, an art style or both from reference images at generation time, with no LoRA per character. It needs folders from `tools/e621_pull.py` captioned with the `reference fields (JSON)` preset.
+
+- Every step pairs an image with one or two references. A character reference shows the same single character by another artist. A style reference is by the same artist with no shared character. A character+style reference shares both. The caption leaves out the fields the references supply, and drops the outfit half the time when the character comes from a reference. One step in ten has no references. Versions of one post and near duplicates are never paired. Model sheets are only used as references.
+- Each training image gets up to 6 caption variants. All of them are encoded once before training: about 6,300 for the 1,666-image pull, roughly 11 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
+- References run through the transformer next to the image at timestep 0. Each one only attends to itself. The image and the prompt attend to all of them. While sampling, each reference's per-block keys and values are computed once and reused every step. That takes about 0.5 GB of VRAM per 512px reference for the length of the run. The file is a normal LoRA plus `ez_moss_reference.mode_embedding`, one learned vector per mode.
+
+To generate, add one **EZ MOSS Reference** per image (`mode`, `strength`, `fidelity`) and connect them all to **EZ MOSS Apply References** together with the model, the VAE and the adapter. `strength` scales the attention paid to that reference. `fidelity` is the fraction of the sampling steps that see it, so lower values keep the broad look and leave the details to the prompt. References are scaled to about `size` x `size` pixels, 512 like the training resolution.
+
 ## Defaults
 
 These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:
