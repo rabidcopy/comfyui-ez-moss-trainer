@@ -26,6 +26,20 @@ Captions every image in a folder (subfolders included) with a vision LLM served 
 
 Connect its `folder` output to the trainer's `dataset_paths` input to caption and train in one run. Changed captions are re-encoded automatically.
 
+## EZ MOSS Prompt Writer
+
+Writes or enhances a MOSS-Image prompt with an LLM behind the same kind of OpenAI-compatible API as the captioner, and outputs it as a string for a CLIP Text Encode node. Connect any number of reference images: a new `image` socket appears each time you connect one, and batches are expanded. Images need a vision model.
+
+| Preset | What it writes |
+|---|---|
+| `enhance prompt` (default) | Your prompt expanded with concrete subject, setting, composition, lighting and style details. Images act as visual reference. |
+| `character from references` | The character's permanent look from the images, placed into your scene. With no prompt, a full-body portrait. |
+| `style from references` | The images' art style worked out in detail, applied to your prompt without copying their subjects. |
+| `character + style from references` | Both of the above together. |
+| `recreate image` | A prompt that reproduces the image. Your prompt lists changes to make. |
+
+Every preset asks for one plain paragraph, with any text to render quoted. `system_prompt` replaces the preset entirely, and `extra_instructions` is appended to whichever is active. `seed` is sent to the API and changes after each run, so queueing again gives a new variation. Reply cleanup, retries, the `max_tokens` handling for thinking models and the **list models** button work the same as in the captioner. The final prompt is also printed to the console.
+
 ## Usage
 
 `Load Diffusion Model` (MOSS) + `Load CLIP` (type `moss_image`) + `Load VAE` (Flux2) → **EZ MOSS-Image LoRA Trainer**.

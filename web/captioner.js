@@ -64,7 +64,7 @@ function showModelPicker(models, current, x, y, onPick) {
 app.registerExtension({
     name: "ez_moss.captioner",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "EZCaptionDataset") return;
+        if (!["EZCaptionDataset", "EZMOSSPromptWriter"].includes(nodeData.name)) return;
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated?.apply(this, arguments);
