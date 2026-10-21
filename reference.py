@@ -1,8 +1,10 @@
+import logging
 import math
 
 import torch
 
 import comfy.ldm.flux.math
+import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
 import comfy.patcher_extension
@@ -125,24 +127,39 @@ def forward(dit, x, timestep, context, refs, modes, transformer_options={}):
 
 def reference_kv(dit, refs, modes, x, transformer_options):
     """Per block keys and values of the references alone, at timestep 0 and frame 0. Same math as forward, since the
-    references never attend to the target or text."""
+    references never attend to the target or text.
+
+    Each reference runs alone, so the peak is one reference's activations. A reference whose cache does not fit in free
+    VRAM, leaving ComfyUI's inference reserve, is cached in pinned RAM and copied in per block. Returns kv[ref][block]."""
     dtype, device = x.dtype, x.device
     transformer_options = transformer_options.copy()
     shapes = [latent.shape[-2:] for latent, _ in refs]
     vec = dit.time_embedding(timestep_embedding(torch.zeros(1, device=device), 256).to(dtype))
     mod = dit.shared_block_modulation(vec).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
     mode_embedding = comfy.ops.cast_to_input(modes, x, copy=False)
-    tokens = torch.cat([dit.video_embedder(comfy.ops.cast_to_input(latent, x, copy=False).flatten(2).transpose(1, 2)) + mode_embedding[mode] for latent, mode in refs], dim=1)
+    pe = reference_rope(dit, shapes, 0.0, device, transformer_options)
+    override = transformer_options.get("optimized_attention_override")
     kv = []
-    attention = with_mask(transformer_options, block_diagonal(shapes, device, dtype)) if len(refs) > 1 else transformer_options.get("optimized_attention_override")
+    start = 0
+    in_ram = 0
+    for (latent, mode), (h, w) in zip(refs, shapes):
+        size = 2 * len(dit.layers) * h * w * dit.video_embedder.weight.shape[0] * x.element_size()
+        offload = device.type != "cpu" and size > comfy.model_management.get_free_memory(device) - comfy.model_management.minimum_inference_memory()
+        in_ram += offload
+        ref_kv = []
 
-    def capture(func, *args, **kwargs):
-        # v is a chunk of the fused qkv output, copy it so the whole qkv is not kept
-        kv.append((args[1].contiguous(), args[2].contiguous()))
-        return attention(func, *args, **kwargs) if attention is not None else func(*args, **kwargs)
+        def capture(func, *args, **kwargs):
+            # v is a chunk of the fused qkv output, copy it so the whole qkv is not kept
+            ref_kv.append(tuple(torch.empty_like(t, device="cpu", pin_memory=device.type == "cuda").copy_(t) if offload else t.contiguous() for t in args[1:3]))
+            return override(func, *args, **kwargs) if override is not None else func(*args, **kwargs)
 
-    transformer_options["optimized_attention_override"] = capture
-    run_blocks(dit, tokens, mod, reference_rope(dit, shapes, 0.0, device, transformer_options), vec, transformer_options)
+        transformer_options["optimized_attention_override"] = capture
+        tokens = dit.video_embedder(comfy.ops.cast_to_input(latent, x, copy=False).flatten(2).transpose(1, 2)) + mode_embedding[mode]
+        run_blocks(dit, tokens, mod, pe[:, start:start + h * w], vec, transformer_options)
+        kv.append(ref_kv)
+        start += h * w
+    if in_ram:
+        logging.info(f"[EZ MOSS Reference] {in_ram} of {len(refs)} references cached in RAM, VRAM is full. Sampling is slower, fewer or smaller references avoid it.")
     return kv
 
 
@@ -173,9 +190,8 @@ class References:
         dit = executor.class_obj
         if self.kv is None:
             self.kv = reference_kv(dit, [(latent, mode) for latent, mode, _, _ in self.references], self.modes, x, transformer_options)
-        sizes = [latent.shape[-2] * latent.shape[-1] for latent, _, _, _ in self.references]
-        ranges = None if all(active) else [(sum(sizes[:i]), sum(sizes[:i + 1])) for i, a in enumerate(active) if a]
-        strengths = [(strength, size) for (_, _, strength, _), size, a in zip(self.references, sizes, active) if a]
+        kv = [ref_kv for ref_kv, a in zip(self.kv, active) if a]
+        strengths = [(strength, latent.shape[-2] * latent.shape[-1]) for (latent, _, strength, _), a in zip(self.references, active) if a]
         # the cached keys sit at frame 0, the target is at the text length
         frame = context.shape[1] + transformer_options.get("rope_options", {}).get("shift_t", 0.0)
         shift = ids_rope(dit, torch.tensor([[[0.0, frame, 0.0, 0.0]]], device=x.device), transformer_options)
@@ -185,9 +201,9 @@ class References:
         def attention(func, q, k, v, heads, *args, **kwargs):
             # the text embedder runs before the blocks set block_index and attends over the text alone
             if "block_index" in kwargs["transformer_options"]:
-                ref_k, ref_v = self.kv[kwargs["transformer_options"]["block_index"]]
-                if ranges is not None:
-                    ref_k, ref_v = torch.cat([ref_k[:, a:b] for a, b in ranges], dim=1), torch.cat([ref_v[:, a:b] for a, b in ranges], dim=1)
+                i = kwargs["transformer_options"]["block_index"]
+                ref_k = torch.cat([ref_kv[i][0].to(q.device, non_blocking=True) for ref_kv in kv], dim=1)
+                ref_v = torch.cat([ref_kv[i][1].to(q.device, non_blocking=True) for ref_kv in kv], dim=1)
                 ref_k = rope_split_half(ref_k.unflatten(-1, (heads, -1)), shift).flatten(2)
                 n = q.shape[1]
                 if any(strength != 1 for strength, _ in strengths) and n not in masks:
