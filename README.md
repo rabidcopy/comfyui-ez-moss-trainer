@@ -12,6 +12,7 @@ Captions every image in a folder (subfolders included) with a vision LLM served 
 - Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`. `system_prompt` replaces the preset when set. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
 - `prepend` adds a trigger word, e.g. `mytrigger` → `mytrigger, A woman in...`.
 - Existing captions are kept unless `overwrite` is on. `<think>` blocks, "Here is a caption:" preambles and leaked chat template markers (a caption starting with "model model ...") are stripped. A reply with nothing left is counted as failed and writes no `.txt`.
+- Temporary failures (HTTP 408/429/5xx, timeouts, connection errors, empty replies) are retried up to 3 times with 2/4/8 s backoff, or the server's `Retry-After`. Other errors such as 400 or 401 fail right away. Running the node again only captions images that still have no `.txt`.
 - Leave `api_key` empty to use the `OPENAI_API_KEY` environment variable. A key typed in the node is saved in the workflow.
 
 Connect its `folder` output to the trainer's `dataset_paths` input to caption and train in one run. Changed captions are re-encoded automatically.

@@ -37,6 +37,14 @@ PRESETS = {
 }
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+RETRIES = 3
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+class TransientError(Exception):
+    pass
+
+
 TURN_RE = re.compile(r"<\|?(?:start_of_turn|end_of_turn|im_start|im_end|eot_id|start_header_id|end_header_id)\|?>")
 
 
@@ -170,17 +178,33 @@ class EZCaptionDataset(io.ComfyNode):
                         "max_tokens": max_tokens,
                         "temperature": temperature,
                     }
-                    try:
-                        async with session.post(url, json=payload, headers=_headers(api_key)) as r:
-                            if r.status != 200:
-                                raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:300]}")
-                            text = clean_caption((await r.json())["choices"][0]["message"]["content"] or "")
-                        if not text:
-                            raise RuntimeError("empty caption")
-                    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, KeyError, IndexError) as e:
+                    name = os.path.relpath(path, folder)
+                    for attempt in range(RETRIES + 1):
+                        comfy.model_management.throw_exception_if_processing_interrupted()
+                        retry_after = None
+                        try:
+                            async with session.post(url, json=payload, headers=_headers(api_key)) as r:
+                                if r.status != 200:
+                                    if r.status in RETRY_STATUS:
+                                        retry_after = r.headers.get("Retry-After")
+                                        raise TransientError(f"HTTP {r.status}: {(await r.text())[:300]}")
+                                    raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:300]}")
+                                text = clean_caption((await r.json())["choices"][0]["message"]["content"] or "")
+                            if not text:
+                                raise TransientError("empty caption")
+                            break
+                        except (aiohttp.ClientError, asyncio.TimeoutError, TransientError) as e:
+                            error = str(e) or type(e).__name__
+                            if attempt < RETRIES:
+                                delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt + 1)
+                                logging.info(f"[EZ Captioner] {name}: {error}, retrying in {delay:.0f}s ({attempt + 1}/{RETRIES})")
+                                await asyncio.sleep(delay)
+                                continue
+                        except (RuntimeError, KeyError, IndexError) as e:
+                            error = str(e) or type(e).__name__
                         failed.append(path)
                         pbar.update(1)
-                        logging.warning(f"[EZ Captioner] {os.path.relpath(path, folder)} failed: {str(e) or type(e).__name__}")
+                        logging.warning(f"[EZ Captioner] {name} failed: {error}")
                         return
                     if prepend:
                         text = f"{prepend}{'' if prepend[-1] in ',.;:' else ','} {text}"
@@ -188,7 +212,7 @@ class EZCaptionDataset(io.ComfyNode):
                         f.write(text)
                     done += 1
                     pbar.update(1)
-                    logging.info(f"[EZ Captioner] {done + len(failed)}/{len(todo)} {os.path.relpath(path, folder)}: {text[:120]}{'...' if len(text) > 120 else ''}")
+                    logging.info(f"[EZ Captioner] {done + len(failed)}/{len(todo)} {name}: {text[:120]}{'...' if len(text) > 120 else ''}")
 
             await asyncio.gather(*(caption(p) for p in todo))
 
