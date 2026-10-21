@@ -115,7 +115,7 @@ class EZCaptionDataset(io.ComfyNode):
                 io.String.Input("system_prompt", multiline=True, default="", tooltip="Replaces the preset's instructions when not empty."),
                 io.Boolean.Input("overwrite", default=False, tooltip="Re-caption images that already have a .txt."),
                 io.Int.Input("max_image_size", default=1024, min=256, max=4096, step=64, tooltip="Longest side of the image sent to the model."),
-                io.Int.Input("max_tokens", default=512, min=16, max=8192),
+                io.Int.Input("max_tokens", default=2048, min=16, max=32768, tooltip="Reply token limit. Thinking models spend tokens reasoning before the caption, so keep this high, non-thinking models stop on their own."),
                 io.Float.Input("temperature", default=0.2, min=0.0, max=2.0, step=0.05),
                 io.Int.Input("concurrency", default=1, min=1, max=16, tooltip="Parallel requests. Local servers usually want 1."),
                 io.Int.Input("timeout", default=180, min=5, max=3600, tooltip="Seconds per request."),
@@ -189,9 +189,16 @@ class EZCaptionDataset(io.ComfyNode):
                                         retry_after = r.headers.get("Retry-After")
                                         raise TransientError(f"HTTP {r.status}: {(await r.text())[:300]}")
                                     raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:300]}")
-                                text = clean_caption((await r.json())["choices"][0]["message"]["content"] or "")
+                                choice = (await r.json())["choices"][0]
+                            text = clean_caption(choice["message"].get("content") or "")
                             if not text:
-                                raise TransientError("empty caption")
+                                finish = choice.get("finish_reason")
+                                reasoning = choice["message"].get("reasoning_content") or choice["message"].get("reasoning")
+                                if finish == "length":
+                                    # thinking models can spend the whole budget reasoning, retrying with the same limit rarely helps
+                                    raise RuntimeError(f"reply hit max_tokens ({max_tokens}) before any caption" + (" while the model was still reasoning" if reasoning else "")
+                                                       + ", raise max_tokens or use a non-thinking model")
+                                raise TransientError(f"empty caption (finish_reason {finish}" + (", reasoning only" if reasoning else "") + ")")
                             break
                         except (aiohttp.ClientError, asyncio.TimeoutError, TransientError) as e:
                             error = str(e) or type(e).__name__

@@ -8,10 +8,11 @@ It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay qua
 
 Captions every image in a folder (subfolders included) with a vision LLM served behind an OpenAI-compatible API, and writes `image.txt` next to `image.png`. It defaults to LM Studio on `http://127.0.0.1:1234/v1`. Ollama (`:11434/v1`), llama.cpp (`:8080/v1`), vLLM and OpenAI work the same way. Requests only go to the `base_url` you set.
 
-- **list models** fetches `<base_url>/models` and fills the `model` field. Text already in `model` filters the list (type `gemma-4-12b` and press the button to see only matching ids). An empty `model` uses the first model the server lists.
+- **list models** fetches `<base_url>/models` and opens a searchable picker at the button. Type to filter (several words all have to match, e.g. `qwen vl`), then click a model or press Enter. An empty `model` uses the first model the server lists. If the button still shows the old menu after updating, hard refresh the browser (Ctrl+F5).
 - Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`. `system_prompt` replaces the preset when set. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
 - `prepend` adds a trigger word, e.g. `mytrigger` → `mytrigger, A woman in...`.
 - Existing captions are kept unless `overwrite` is on. `<think>` blocks, "Here is a caption:" preambles and leaked chat template markers (a caption starting with "model model ...") are stripped. A reply with nothing left is counted as failed and writes no `.txt`.
+- `max_tokens` defaults to 2048 because thinking models spend tokens reasoning before the caption. A reply cut off at `max_tokens` with no caption fails right away with a hint to raise it.
 - Temporary failures (HTTP 408/429/5xx, timeouts, connection errors, empty replies) are retried up to 3 times with 2/4/8 s backoff, or the server's `Retry-After`. Other errors such as 400 or 401 fail right away. Running the node again only captions images that still have no `.txt`.
 - Leave `api_key` empty to use the `OPENAI_API_KEY` environment variable. A key typed in the node is saved in the workflow.
 
