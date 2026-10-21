@@ -36,6 +36,46 @@ class LohaBypass(LohaDiff):
         return torch.nn.functional.linear(x, diff.to(x.dtype)) * self.multiplier
 
 
+class RecomputeInBackward(torch.autograd.Function):
+    """Runs a streamed op without saving anything but its input, and reruns it right at its backward.
+
+    Streamed weights live in reused cast buffers or paged VRAM, so a weight saved in the forward is gone by the backward.
+    Unlike a nested torch.utils.checkpoint, the input goes through save_for_backward, so the enclosing block checkpoint
+    can still drop it. params are the op's adapter parameters, they make the output require grad when the input does not."""
+
+    @staticmethod
+    def forward(ctx, fn, x, *params):
+        ctx.fn = fn
+        ctx.autocast = torch.is_autocast_enabled(x.device.type), torch.get_autocast_dtype(x.device.type)
+        ctx.save_for_backward(x)
+        with torch.no_grad():
+            return fn(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, = ctx.saved_tensors
+        with torch.enable_grad(), torch.autocast(x.device.type, dtype=ctx.autocast[1], enabled=ctx.autocast[0]):
+            x = x.detach().requires_grad_(ctx.needs_input_grad[1])
+            out = ctx.fn(x)
+        torch.autograd.backward(out, grad)
+        return (None, x.grad if ctx.needs_input_grad[1] else None) + (None,) * (len(ctx.needs_input_grad) - 2)
+
+
+def recompute_in_backward(module, params):
+    forward = module.forward
+
+    # dynamo can't trace the custom Function with dynamic shapes, compiled blocks graph-break around it
+    @torch.compiler.disable
+    def recompute_forward(x):
+        if not torch.is_grad_enabled() or not (x.requires_grad or params):
+            return forward(x)
+        return RecomputeInBackward.apply(forward, x, *params)
+
+    # same convention as nodes_train.patch so unpatch restores it
+    module.org_forward = forward
+    module.forward = recompute_forward
+
+
 def setup_adapters(mp, algorithm, rank, alpha, target):
     """Bypass adapters on the transformer block linears. Bypass keeps quantized (int8/convrot) base weights on their quantized path."""
     names = TARGET_PRESETS[target]
@@ -124,13 +164,13 @@ def make_validation_set(items, seed, device, dtype):
     """Up to 4 images spread over the dataset, each with fixed noise levels and noise."""
     n = min(4, len(items))
     generator = torch.Generator(device=device).manual_seed(seed + 1)
-    sigma = torch.tensor(VALIDATION_SIGMAS, device=device)
     val_set = []
     for i in range(n):
         item = items[round(i * (len(items) - 1) / max(1, n - 1))]
-        x0 = item["latent"][None].to(device, torch.float32).expand(len(VALIDATION_SIGMAS), -1, -1, -1)
-        context = item["cond"][None].to(device, dtype).expand(len(VALIDATION_SIGMAS), -1, -1)
-        val_set.append((x0, context, torch.randn(x0.shape, generator=generator, device=device), sigma))
+        x0 = item["latent"][None].to(device, torch.float32)
+        context = item["cond"][None].to(device, dtype)
+        for sigma in VALIDATION_SIGMAS:
+            val_set.append((x0, context, torch.randn(x0.shape, generator=generator, device=device), torch.tensor([sigma], device=device)))
     return val_set
 
 
@@ -143,6 +183,8 @@ def validation_loss(model, val_set, dtype, autocast, transformer_options):
             with torch.autocast(x0.device.type, dtype=dtype, enabled=autocast):
                 pred = model.diffusion_model(((1 - s) * x0 + s * noise).to(dtype), model.model_sampling.timestep(sigma).float(), context=context, transformer_options=transformer_options)
             total += torch.nn.functional.mse_loss(pred.float(), noise - x0).item()
+    # hand the cached activation memory back to dynamic VRAM's weight cache
+    torch.cuda.empty_cache()
     return total / len(val_set)
 
 
@@ -199,9 +241,7 @@ def train(mp, items, empty_cond, cfg, save_path):
     try:
         for injection in injections:
             injection.inject(mp)
-        # streamed weights live in reused cast buffers, so a saved weight is overwritten before backward:
-        # checkpoint each streamed op to fetch its weight again right at its backward
-        streamed = [m for m in mp.model.diffusion_model.modules() if hasattr(m, "comfy_cast_weights") and (mp.is_dynamic() or hasattr(m, "prev_comfy_cast_weights"))]
+        streamed = {n: m for n, m in mp.model.named_modules() if hasattr(m, "comfy_cast_weights") and (mp.is_dynamic() or hasattr(m, "prev_comfy_cast_weights"))}
         if streamed:
             logging.info(f"[MOSS Trainer] {len(streamed)} layers are streamed from RAM and recomputed in the backward pass")
         if cfg["compile"] and importlib.util.find_spec("triton") is None:
@@ -211,9 +251,11 @@ def train(mp, items, empty_cond, cfg, save_path):
             logging.info("[MOSS Trainer] Compiling transformer blocks, the first step takes about a minute longer")
             for block in mp.model.diffusion_model.layers:
                 block.forward = torch.compile(block.forward)
-        blocks += streamed
         for block in blocks:
             patch(block)
+        for name, m in streamed.items():
+            recompute_in_backward(m, [p for p in adapters[name].parameters() if p.requires_grad] if name in adapters else [])
+        blocks += streamed.values()
         optimizer = make_optimizer(cfg["optimizer"], params, cfg["learning_rate"], cfg["weight_decay"], device)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps))
         comfy.model_management.in_training = True
@@ -222,7 +264,7 @@ def train(mp, items, empty_cond, cfg, save_path):
             val_start = validation_loss(mp.model, val_set, dtype, autocast, transformer_options)
             validation.append(val_start)
             validation_steps.append(0)
-            logging.info(f"[MOSS Trainer] validation loss {val_start:.4f} before training ({len(val_set)} images x {len(VALIDATION_SIGMAS)} noise levels)")
+            logging.info(f"[MOSS Trainer] validation loss {val_start:.4f} before training ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
         for step in range(steps):
             comfy.model_management.throw_exception_if_processing_interrupted()
             step_loss = 0.0

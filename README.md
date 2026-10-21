@@ -2,12 +2,13 @@
 
 One ComfyUI node that trains a LoRA, LoHa, LoKr or OFT adapter on the MOSS-Image transformer. Only the transformer is trained. The text encoder and VAE are used once to fill a disk cache.
 
-It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay quantized and frozen: adapters run in bypass mode, so the int8 GEMM is used in the forward pass and the weight is dequantized per layer in the backward pass. Speed on an RTX 3050 8 GB with the int8 convrot transformer at 512px and ComfyUI's default dynamic VRAM, measured as steady-state s/step:
+It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay quantized and frozen: adapters run in bypass mode, so the int8 GEMM is used in the forward pass and the weight is dequantized per layer in the backward pass. Speed on an RTX 3050 8 GB with the int8 convrot transformer and ComfyUI's default dynamic VRAM, measured as steady-state s/step (peak is PyTorch's allocated peak):
 
-| Captions | `compile` off | `compile` on (default) |
-|---|---|---|
-| Short (~15 tokens) | 3.7 s/step, 3.7 GB peak | 2.7 s/step, 2.7 GB peak |
-| Detailed (~250 tokens) | 6.1 s/step, 4.7 GB peak | 4.4 s/step, 3.4 GB peak |
+| Resolution, captions | `compile` off | `compile` on (default) | Peak VRAM |
+|---|---|---|---|
+| 512, short (~15 tokens) | 2.9 s/step | 2.5 s/step | 0.9 GB |
+| 512, detailed (~250 tokens) | 3.6 s/step | 3.1 s/step | 1.0 GB |
+| 1024, detailed (~250 tokens) | 13.6 s/step | 12.0 s/step | 2.4 GB |
 
 Text tokens go through every transformer block along with the image tokens, so long captions cost time. `--disable-pinned-memory` made no measurable difference with dynamic VRAM.
 
@@ -78,11 +79,11 @@ These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:
 
 ## Compile
 
-`compile` (default on) runs `torch.compile` on each transformer block, which fuses the norm, modulation, rope and activation work around the matmuls. Training math is unchanged: losses match uncompiled runs to 3–4 digits. Expect the first step to take about a minute longer. Different buckets and caption lengths do not trigger further recompiles. It needs triton (`triton-windows` on Windows); without it, the node logs a warning and trains uncompiled. Forcing the cuDNN, flash or memory-efficient attention backend was not faster than PyTorch's default choice.
+`compile` (default on) runs `torch.compile` on each transformer block, which fuses the norm, modulation, rope and activation work around the matmuls. Training math is unchanged: losses match uncompiled runs to 3–4 digits. Expect the first step to take about a minute longer. Different buckets and caption lengths do not trigger further recompiles. Streamed layers stay outside the compiled graph, which is split around them. It needs triton (`triton-windows` on Windows); without it, the node logs a warning and trains uncompiled. Forcing the cuDNN, flash or memory-efficient attention backend was not faster than PyTorch's default choice.
 
 ## VRAM
 
-With dynamic VRAM (the ComfyUI default), weights are paged in per block automatically, so there is nothing to tune. The first step takes about 20 s while weights are paged in. After caching, the node unloads the text encoder and VAE so the transformer has RAM and VRAM to itself. The model compiler is paused during training and restored afterwards.
+With dynamic VRAM (the ComfyUI default), weights are paged in per block automatically, so there is nothing to tune. The first step takes about 20 s while weights are paged in. After caching, the node unloads the text encoder and VAE so the transformer has RAM and VRAM to itself. The model compiler is paused during training and restored afterwards. Each layer is re-run right before its own backward pass, so a weight that dynamic VRAM has already paged out never gets used. Only each block's input is kept between the forward and backward passes, about 25 MB per block at 1024px. A validation pass at 1024px takes about 45 s, so keep `validation_every` around 100 or higher there.
 
 With legacy loading (`--disable-dynamic-vram`), `vram_reserve_gb` (default 2.5) is the VRAM kept free for activations, gradients and streaming buffers. Transformer weights that do not fit in the rest are streamed from system RAM each step, and those layers are recomputed in the backward pass. If you run out of memory, raise the reserve or lower the resolution. On a 6 GB card, try a reserve of 3–3.5. Streaming relies on pinned memory: with `--disable-pinned-memory`, legacy loading measured about 15 s/step, so stay on dynamic VRAM.
 
