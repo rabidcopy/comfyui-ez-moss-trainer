@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import math
@@ -203,6 +204,13 @@ def train(mp, items, empty_cond, cfg, save_path):
         streamed = [m for m in mp.model.diffusion_model.modules() if hasattr(m, "comfy_cast_weights") and (mp.is_dynamic() or hasattr(m, "prev_comfy_cast_weights"))]
         if streamed:
             logging.info(f"[MOSS Trainer] {len(streamed)} layers are streamed from RAM and recomputed in the backward pass")
+        if cfg["compile"] and importlib.util.find_spec("triton") is None:
+            logging.warning("[MOSS Trainer] compile needs triton (triton-windows on Windows), training without it")
+        elif cfg["compile"]:
+            # fuses the norm/modulation/rope/activation work around the matmuls, the first steps include compile time
+            logging.info("[MOSS Trainer] Compiling transformer blocks, the first step takes about a minute longer")
+            for block in mp.model.diffusion_model.layers:
+                block.forward = torch.compile(block.forward)
         blocks += streamed
         for block in blocks:
             patch(block)
@@ -271,6 +279,9 @@ def train(mp, items, empty_cond, cfg, save_path):
         args.disable_comfy_compiler = disable_compiler
         for block in blocks:
             unpatch(block)
+        if cfg["compile"]:
+            for block in mp.model.diffusion_model.layers:
+                block.__dict__.pop("forward", None)
         for injection in injections:
             injection.eject(mp)
         # the weights were moved outside inference mode, unload so the next prompt reloads them cleanly

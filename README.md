@@ -2,7 +2,14 @@
 
 One ComfyUI node that trains a LoRA, LoHa, LoKr or OFT adapter on the MOSS-Image transformer. Only the transformer is trained. The text encoder and VAE are used once to fill a disk cache.
 
-It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay quantized and frozen: adapters run in bypass mode, so the int8 GEMM is used in the forward pass and the weight is dequantized per layer in the backward pass. On an RTX 3050 8 GB with the int8 convrot transformer at 512px, LoRA training takes about 3.2 s/step with ComfyUI's default dynamic VRAM (3.7 GB peak), and about 2.8 s/step with legacy loading (`--disable-dynamic-vram`, about 6.5 GB peak).
+It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay quantized and frozen: adapters run in bypass mode, so the int8 GEMM is used in the forward pass and the weight is dequantized per layer in the backward pass. Speed on an RTX 3050 8 GB with the int8 convrot transformer at 512px and ComfyUI's default dynamic VRAM, measured as steady-state s/step:
+
+| Captions | `compile` off | `compile` on (default) |
+|---|---|---|
+| Short (~15 tokens) | 3.7 s/step, 3.7 GB peak | 2.7 s/step, 2.7 GB peak |
+| Detailed (~250 tokens) | 6.1 s/step, 4.7 GB peak | 4.4 s/step, 3.4 GB peak |
+
+Text tokens go through every transformer block along with the image tokens, so long captions cost time. `--disable-pinned-memory` made no measurable difference with dynamic VRAM.
 
 ## EZ Dataset Captioner
 
@@ -68,6 +75,10 @@ These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:
 | resolution | 512 | Aspect buckets of equal area in 64px steps |
 | timesteps | logit-normal, shift 1.0 | x_t = (1-σ)·x0 + σ·ε, MSE on the velocity ε − x0 |
 | warmup | 50 steps | |
+
+## Compile
+
+`compile` (default on) runs `torch.compile` on each transformer block, which fuses the norm, modulation, rope and activation work around the matmuls. Training math is unchanged: losses match uncompiled runs to 3–4 digits. Expect the first step to take about a minute longer. Different buckets and caption lengths do not trigger further recompiles. It needs triton (`triton-windows` on Windows); without it, the node logs a warning and trains uncompiled. Forcing the cuDNN, flash or memory-efficient attention backend was not faster than PyTorch's default choice.
 
 ## VRAM
 

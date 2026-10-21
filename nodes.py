@@ -59,6 +59,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.String.Input("cache_dir", default="", tooltip="Where latents and text encodings are cached. Empty uses a .moss_cache folder inside each dataset folder."),
                 io.Int.Input("validation_every", default=100, min=0, max=1000000,
                              tooltip="Log a validation loss on up to 4 dataset images at fixed noise levels and noise every N steps, a much steadier progress signal than the training loss. 0 disables."),
+                io.Boolean.Input("compile", default=True,
+                                 tooltip="torch.compile the transformer blocks: about 25% faster and about 1 GB less VRAM, the first step takes about a minute longer. Needs triton (triton-windows on Windows), skipped with a warning when it is missing."),
             ],
             outputs=[
                 io.Custom("LORA_MODEL").Output(display_name="lora", tooltip="Trained weights, connect to Load LoRA Model to try them."),
@@ -71,7 +73,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
                 resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
-                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every) -> io.NodeOutput:
+                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
             raise ValueError(f"EZ MOSS Trainer needs a MOSS-Image model, got {type(model.model).__name__}.")
         if algorithm not in adapter_maps or target_layers not in TARGET_PRESETS or save_dtype not in ("bf16", "fp32"):
@@ -97,7 +99,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                    "optimizer": optimizer, "lr_scheduler": lr_scheduler, "warmup_steps": warmup_steps, "weight_decay": weight_decay,
                    "max_grad_norm": max_grad_norm, "caption_dropout": caption_dropout, "timestep_distribution": timestep_distribution,
                    "timestep_shift": timestep_shift, "gradient_checkpointing": gradient_checkpointing, "vram_reserve_gb": vram_reserve_gb,
-                   "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every}
+                   "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every, "compile": compile}
             logging.info(f"[MOSS Trainer] Saving to {save_path}*.safetensors")
             with torch.enable_grad():
                 lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path)
