@@ -8,10 +8,10 @@ It works with bf16 and int8 / int8-convrot MOSS files. The base weights stay qua
 
 Captions every image in a folder (subfolders included) with a vision LLM served behind an OpenAI-compatible API, and writes `image.txt` next to `image.png`. It defaults to LM Studio on `http://127.0.0.1:1234/v1`. Ollama (`:11434/v1`), llama.cpp (`:8080/v1`), vLLM and OpenAI work the same way. Requests only go to the `base_url` you set.
 
-- **list models** fetches `<base_url>/models` and fills the `model` field. An empty `model` uses the first model the server lists.
+- **list models** fetches `<base_url>/models` and fills the `model` field. Text already in `model` filters the list (type `gemma-4-12b` and press the button to see only matching ids). An empty `model` uses the first model the server lists.
 - Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`. `system_prompt` replaces the preset when set. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
 - `prepend` adds a trigger word, e.g. `mytrigger` → `mytrigger, A woman in...`.
-- Existing captions are kept unless `overwrite` is on. `<think>` blocks and "Here is a caption:" preambles are stripped.
+- Existing captions are kept unless `overwrite` is on. `<think>` blocks, "Here is a caption:" preambles and leaked chat template markers (a caption starting with "model model ...") are stripped. A reply with nothing left is counted as failed and writes no `.txt`.
 - Leave `api_key` empty to use the `OPENAI_API_KEY` environment variable. A key typed in the node is saved in the workflow.
 
 Connect its `folder` output to the trainer's `dataset_paths` input to caption and train in one run. Changed captions are re-encoded automatically.

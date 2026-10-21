@@ -37,6 +37,7 @@ PRESETS = {
 }
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+TURN_RE = re.compile(r"<\|?(?:start_of_turn|end_of_turn|im_start|im_end|eot_id|start_header_id|end_header_id)\|?>")
 
 
 def _api_key(api_key):
@@ -64,7 +65,10 @@ def encode_image(path, max_size):
 
 
 def clean_caption(text):
-    text = THINK_RE.sub("", text).strip()
+    text = THINK_RE.sub("", text)
+    # some providers leak chat template turn markers, e.g. gemma's "<start_of_turn>model" arrives as "model model ..."
+    text = TURN_RE.sub(" ", text).strip()
+    text = re.sub(r"^(?:(?:model|assistant)\b[\s:]*)+", "", text)
     text = re.sub(r"^(here is|here's)[^:\n]*:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^caption:\s*", "", text, flags=re.IGNORECASE)
     if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
