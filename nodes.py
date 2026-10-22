@@ -65,6 +65,9 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Boolean.Input("reference_training", default=False,
                                  tooltip="Train a reference adapter for EZ MOSS Apply References instead of a plain LoRA. Needs folders from tools/e621_pull.py captioned with the "
                                          "'reference fields (JSON)' preset: every step pairs an image with character or style references and leaves what they supply out of the caption."),
+                io.Int.Input("text_batch", default=8, min=1, max=64,
+                             tooltip="Captions encoded together while caching text. 8 is about 1.6x faster than 1 on an 8 GB card and gives the same result, "
+                                     "larger batches are not faster. Lower it if caching runs out of memory, 1 encodes one caption at a time."),
             ],
             outputs=[
                 io.Custom("LORA_MODEL").Output(display_name="lora", tooltip="Trained weights, connect to Load LoRA Model to try them."),
@@ -77,7 +80,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
                 resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
-                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile, reference_training) -> io.NodeOutput:
+                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile, reference_training, text_batch) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
             raise ValueError(f"EZ MOSS Trainer needs a MOSS-Image model, got {type(model.model).__name__}.")
         if algorithm not in adapter_maps or target_layers not in TARGET_PRESETS or save_dtype not in ("bf16", "fp32"):
@@ -93,10 +96,10 @@ class EZMOSSTrainLoRA(io.ComfyNode):
         folders = parse_dataset_paths(dataset_paths)
         cache_dir = os.path.abspath(cache_dir.strip()) if cache_dir.strip() else ""
         with torch.inference_mode(False):
-            items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, encode_captions=not reference_training)
+            items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, text_batch, encode_captions=not reference_training)
             pairs = ReferencePairs(items) if reference_training else None
             if pairs is not None:
-                pairs.cache_text(clip)
+                pairs.cache_text(clip, text_batch)
             empty_cond = cached_cond(clip, "", cache_dir, folders[0][0]) if caption_dropout > 0 else None
             # free the text encoder and VAE, the transformer needs the VRAM and pinned RAM while training
             comfy.model_management.unload_model_and_clones(clip.patcher)

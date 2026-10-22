@@ -104,6 +104,34 @@ def encode_text(clip, caption):
     return clip.encode_from_tokens(tokens)[0].to(torch.bfloat16).cpu().contiguous()
 
 
+def encode_texts(clip, captions):
+    """encode_text for several captions in one padded batch. Each caption is padded at its end with masked pad tokens and
+    the text encoder is causal, so the result matches encoding them one at a time."""
+    tokens = [clip.tokenize(caption) for caption in captions]
+    key = next(iter(tokens[0]))
+    sections = [t[key][0] for t in tokens]
+    longest = max(len(s) for s in sections)
+    pad = getattr(clip.tokenizer, key).pad_token
+    cond = clip.encode_from_tokens({key: [s + [(pad, 1.0)] * (longest - len(s)) for s in sections]})[0]
+    cond = cond.unflatten(0, (len(sections), longest)).to(torch.bfloat16).cpu()
+    return [c[:len(s)].contiguous() for c, s in zip(cond, sections)]
+
+
+def cache_texts(clip, todo, batch_size):
+    """Encodes {path: caption} in batches of similar length and saves each encoding to its path."""
+    pbar = comfy.utils.ProgressBar(len(todo))
+    todo = sorted(todo.items(), key=lambda x: len(x[1]))
+    for n in range(0, len(todo), batch_size):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        batch = todo[n:n + batch_size]
+        for (path, _), cond in zip(batch, encode_texts(clip, [caption for _, caption in batch])):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            safetensors.torch.save_file({"cond": cond}, path)
+        pbar.update(len(batch))
+        if (n + len(batch)) // 100 > n // 100:
+            logging.info(f"[MOSS Trainer]   text {n + len(batch)}/{len(todo)}")
+
+
 def text_path(cache, caption):
     return os.path.join(cache, "text", _key(caption) + ".safetensors")
 
@@ -116,7 +144,7 @@ def cached_cond(clip, caption, cache_root, folder):
     return safetensors.torch.load_file(path)["cond"]
 
 
-def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, encode_captions=True):
+def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, text_batch, encode_captions=True):
     """Scan the folders, assign buckets and fill the latent / text caches. encode_captions off leaves the .txt captions unencoded."""
     buckets = make_buckets(resolution, bucketing)
     items = []
@@ -154,13 +182,7 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
     todo = {i["text_path"]: i["caption"] for i in items if encode_captions and not os.path.isfile(i["text_path"])}
     if todo:
         logging.info(f"[MOSS Trainer] Caching {len(todo)} text encodings")
-        pbar = comfy.utils.ProgressBar(len(todo))
-        for n, (path, caption) in enumerate(todo.items()):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            safetensors.torch.save_file({"cond": encode_text(clip, caption)}, path)
-            pbar.update(1)
-            if (n + 1) % 25 == 0:
-                logging.info(f"[MOSS Trainer]   text {n + 1}/{len(todo)}")
+        cache_texts(clip, todo, text_batch)
 
     for item in items:
         item["latent"] = safetensors.torch.load_file(item["latent_path"])["latent"]

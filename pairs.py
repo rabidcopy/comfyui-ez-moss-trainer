@@ -5,10 +5,7 @@ import os
 import safetensors.torch
 from PIL import Image
 
-import comfy.model_management
-import comfy.utils
-
-from .dataset import encode_text, text_path
+from .dataset import cache_texts, text_path
 from .reference import MODES
 
 NO_REFERENCES = 0.1
@@ -91,19 +88,12 @@ class ReferencePairs:
                      f"{len(meta)} of {len(items)} images have a sidecar and reference fields. Images per plan: "
                      + ", ".join(f"{' + '.join(mode + ' ref' for mode in modes)}: {c}" for modes, c in counts.items()))
 
-    def cache_text(self, clip):
+    def cache_text(self, clip, batch_size):
         todo = {path: caption(self.fields[t], drop) for t, variants in self.text.items() for drop, path in variants.items() if not os.path.isfile(path)}
         if not todo:
             return
         logging.info(f"[MOSS Trainer] Caching {len(todo)} reference caption encodings ({len({p for v in self.text.values() for p in v.values()}) - len(todo)} already cached)")
-        pbar = comfy.utils.ProgressBar(len(todo))
-        for n, (path, text) in enumerate(todo.items()):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            safetensors.torch.save_file({"cond": encode_text(clip, text)}, path)
-            pbar.update(1)
-            if (n + 1) % 100 == 0:
-                logging.info(f"[MOSS Trainer]   text {n + 1}/{len(todo)}")
+        cache_texts(clip, todo, batch_size)
 
     def sample(self, i, rng):
         """(text encoding, [(latent, mode index)]) for training image i."""
