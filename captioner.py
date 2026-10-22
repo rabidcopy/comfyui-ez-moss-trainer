@@ -64,7 +64,7 @@ def parse_fields(text):
 
 
 def source_tags(path):
-    """Tags from the <image>.json sidecar written by tools/e621_pull.py, empty when there is none."""
+    """Tags from the <image>.json sidecar, empty when there is none."""
     try:
         with open(os.path.splitext(path)[0] + ".json", "r", encoding="utf-8") as f:
             return [t.replace("_", " ") for t in json.load(f).get("tags", [])]

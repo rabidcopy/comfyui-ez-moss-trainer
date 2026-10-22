@@ -19,7 +19,7 @@ Captions every image in a folder (subfolders included) with a vision LLM served 
 - **list models** fetches `<base_url>/models` and opens a searchable picker at the button. Type to filter (several words all have to match, e.g. `qwen vl`), then click a model or press Enter. An empty `model` uses the first model the server lists. If the button still shows the old menu after updating, hard refresh the browser (Ctrl+F5).
 - Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`, `reference fields (JSON)`. `system_prompt` replaces the preset when set.
 - `reference fields (JSON)` writes one line of JSON with `character` (permanent look), `outfit`, `scene`, `style` and `visible` (`yes`, `partial` or `no`), so captions for reference training can leave out whatever a reference image supplies. A reply that is not such an object, a refusal for example, counts as failed and is retried on the next run. `prepend` is ignored.
-- If an image has a `.json` next to it with a `tags` list, as written by `tools/e621_pull.py`, the tags are sent with the image as hints. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
+- If an image has a `.json` next to it with a `tags` list, the tags are sent with the image as hints. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
 - `prepend` adds a trigger word, e.g. `mytrigger` → `mytrigger, A woman in...`.
 - Existing captions are kept unless `overwrite` is on. `<think>` blocks, "Here is a caption:" preambles and leaked chat template markers (a caption starting with "model model ...") are stripped. A reply with nothing left is counted as failed and writes no `.txt`.
 - `max_tokens` defaults to 2048 because thinking models spend tokens reasoning before the caption. A reply cut off at `max_tokens` with no caption fails right away with a hint to raise it.
@@ -91,10 +91,17 @@ A steady decline means the LoRA is learning the dataset. A large drop late in th
 
 ## Reference adapter
 
-`reference_training` trains an adapter that takes a character's look, an art style or both from reference images at generation time, with no LoRA per character. It needs folders from `tools/e621_pull.py` captioned with the `reference fields (JSON)` preset.
+`reference_training` trains an adapter that takes a character's look, an art style or both from reference images at generation time, with no LoRA per character. It needs captions from the `reference fields (JSON)` preset and a `.json` sidecar next to each image with:
+
+- `artist`: the image's one artist.
+- `characters`: the named characters in it, which can be an empty list.
+- `sheet`: `true` for model and reference sheets.
+- `related`: the post ids of the image and of its other versions, including its own id.
+
+Character and artist names only need to be consistent within the dataset.
 
 - Every step pairs an image with one or two references. A character reference shows the same single character by another artist. A style reference is by the same artist with no shared character. A character+style reference shares both. The caption leaves out the fields the references supply, and drops the outfit half the time when the character comes from a reference. One step in ten has no references. Versions of one post and near duplicates are never paired. Model sheets are only used as references.
-- Each training image gets up to 6 caption variants. All of them are encoded once before training: about 6,300 for the 1,666-image pull, roughly 11 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
+- Each training image gets up to 6 caption variants. All of them are encoded once before training: about 6,300 for 1,666 images, roughly 11 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
 - References run through the transformer next to the image at timestep 0. Each one only attends to itself. The image and the prompt attend to all of them. While sampling, each reference's per-block keys and values are computed once and reused every step. That takes about 0.5 GB of VRAM per 512px reference for the length of the run. A reference that doesn't fit in free VRAM is cached in RAM instead and copied in block by block, which is slower but doesn't run out of memory. The file is a normal LoRA plus `ez_moss_reference.mode_embedding`, one learned vector per mode.
 
 To generate, add one **EZ MOSS Reference** per image (`mode`, `strength`, `fidelity`) and connect them all to **EZ MOSS Apply References** together with the model, the VAE and the adapter. `strength` scales the attention paid to that reference. `fidelity` is the fraction of the sampling steps that see it, so lower values keep the broad look and leave the details to the prompt. References are scaled to about `size` x `size` pixels, 512 like the training resolution.

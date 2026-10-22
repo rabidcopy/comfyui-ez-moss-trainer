@@ -63,8 +63,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Boolean.Input("compile", default=True,
                                  tooltip="torch.compile the transformer blocks: about 25% faster and about 1 GB less VRAM, the first step takes about a minute longer. Needs triton (triton-windows on Windows), skipped with a warning when it is missing."),
                 io.Boolean.Input("reference_training", default=False,
-                                 tooltip="Train a reference adapter for EZ MOSS Apply References instead of a plain LoRA. Needs folders from tools/e621_pull.py captioned with the "
-                                         "'reference fields (JSON)' preset: every step pairs an image with character or style references and leaves what they supply out of the caption."),
+                                 tooltip="Train a reference adapter for EZ MOSS Apply References instead of a plain LoRA. Needs a .json sidecar next to each image (see the README) and captions "
+                                         "from the 'reference fields (JSON)' preset: every step pairs an image with character or style references and leaves what they supply out of the caption."),
                 io.Int.Input("text_batch", default=8, min=1, max=64,
                              tooltip="Captions encoded together while caching text. 8 is about 1.6x faster than 1 on an 8 GB card and gives the same result, "
                                      "larger batches are not faster. Lower it if caching runs out of memory, 1 encodes one caption at a time."),

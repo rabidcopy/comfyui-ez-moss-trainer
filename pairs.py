@@ -28,7 +28,7 @@ def caption(fields, drop):
 
 
 class ReferencePairs:
-    """References for the images of tools/e621_pull.py folders captioned with the 'reference fields (JSON)' preset.
+    """References for images with a .json sidecar (artist, characters, sheet, related) captioned with the 'reference fields (JSON)' preset.
 
     Character references show the same single character by another artist, style references are by the same artist
     with no shared character, character+style references share both. Versions of one post and near duplicates are never
@@ -79,7 +79,8 @@ class ReferencePairs:
             self.plans[t] = plans
             self.text[t] = {drop: text_path(items[t]["cache"], caption(m["fields"], drop)) for drop in drops}
         if not self.plans:
-            raise ValueError("No reference pairs found. reference_training needs folders from tools/e621_pull.py captioned with the 'reference fields (JSON)' preset.")
+            raise ValueError("No reference pairs found. reference_training needs a .json sidecar with artist, characters, sheet and related next to each image, "
+                             "and captions from the 'reference fields (JSON)' preset.")
         for i, item in enumerate(items):
             if i not in self.plans:
                 item["repeats"] = 0
