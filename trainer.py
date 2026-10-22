@@ -8,6 +8,7 @@ import time
 
 import safetensors.torch
 import torch
+from prodigyplus import ProdigyPlusScheduleFree
 
 import comfy.model_management
 from comfy.cli_args import args
@@ -131,6 +132,8 @@ def save_lora(sd, path, metadata):
 def make_optimizer(name, params, lr, weight_decay, device):
     if name == "AdamW":
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
+    if name == "Prodigy":
+        return ProdigyPlusScheduleFree(params, lr=lr, weight_decay=weight_decay)
     if name == "Adafactor":
         return torch.optim.Adafactor(params, lr=lr, weight_decay=weight_decay)
     if name == "SGD":
@@ -182,13 +185,14 @@ def make_validation_set(items, sample, seed, device, dtype):
     return val_set
 
 
-def validation_loss(predict, val_set):
-    """Velocity MSE on the fixed validation set, so changes come from the adapter and not from sampled noise."""
+def validation_loss(predict, val_set, use_refs=True):
+    """Velocity MSE on the fixed validation set, so changes come from the adapter and not from sampled noise.
+    use_refs off drops the references and keeps their captions, so the difference shows how much the references are used."""
     total = 0.0
     with torch.no_grad():
         for x0, context, refs, noise, sigma in val_set:
             s = sigma.view(-1, 1, 1, 1)
-            pred = predict((1 - s) * x0 + s * noise, sigma, context, refs)
+            pred = predict((1 - s) * x0 + s * noise, sigma, context, refs if use_refs else [])
             total += torch.nn.functional.mse_loss(pred.float(), noise - x0).item()
     # hand the cached activation memory back to dynamic VRAM's weight cache
     torch.cuda.empty_cache()
@@ -259,8 +263,8 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
     # quantized checkpoints can pin int8 kitchen attention per block, which has no backward
     transformer_options["optimized_attention_override"] = lambda func, *args, **kwargs: attention_pytorch(*args, **kwargs)
 
-    def sample(i, rng):
-        return pairs.sample(i, rng) if pairs is not None else (items[i]["cond"], [])
+    def sample(i, rng, progress=None):
+        return pairs.sample(i, rng, progress) if pairs is not None else (items[i]["cond"], [])
 
     def predict(xt, sigma, context, refs):
         timestep = model_sampling.timestep(sigma).float()
@@ -286,7 +290,16 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
             os.fsync(f.fileno())
         os.replace(state_path + ".tmp", state_path)
 
+    def validate(step):
+        """Appends the validation loss and returns the log text for the loss without references."""
+        validation.append(validation_loss(predict, val_set))
+        validation_steps.append(step)
+        if pairs is None:
+            return ""
+        return f", {validation_loss(predict, val_set, use_refs=False) - validation[-1]:+.4f} without references"
+
     steps = cfg["steps"]
+    schedule_free = cfg["optimizer"] == "Prodigy"
     metadata = {"ss_base_model_version": "moss_image", "ss_network_module": cfg["algorithm"], "ss_network_dim": cfg["rank"],
                 "ss_network_alpha": cfg["alpha"], "ez_moss_config": json.dumps(cfg)}
     loss_history = state["loss"] if state is not None else []
@@ -330,10 +343,12 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         if cfg["validation_every"] > 0:
             val_set = make_validation_set(items, sample, cfg["seed"], device, dtype)
             if not validation:
-                validation.append(validation_loss(predict, val_set))
-                validation_steps.append(start_step)
-                logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
+                gap = validate(start_step)
+                logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training{gap} ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
             val_start = validation[0]
+        # saved states hold the schedule-free evaluation weights, training steps from the training weights
+        if schedule_free:
+            optimizer.train()
         for step in range(start_step, steps):
             comfy.model_management.throw_exception_if_processing_interrupted()
             step_loss = 0.0
@@ -342,7 +357,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
                 # MOSS has no text mask, rope follows the true length: run each caption length as its own forward, a sample with references alone
                 groups = {}
                 for j, i in enumerate(batch):
-                    cond, refs = sample(i, rng)
+                    cond, refs = sample(i, rng, step / steps)
                     if rng.random() < cfg["caption_dropout"]:
                         cond = empty_cond
                     groups.setdefault(-1 - j if refs else cond.shape[0], []).append((i, cond, refs))
@@ -375,16 +390,24 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
                 vram = torch.cuda.max_memory_allocated(device) / 1024 ** 3 if torch.cuda.is_available() else 0.0
                 logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr:.2e} | grad norm {grad_norm:.3f} | "
                              f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB")
-            if cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps):
-                val = validation_loss(predict, val_set)
-                validation.append(val)
-                validation_steps.append(step + 1)
-                logging.info(f"[MOSS Trainer] validation loss {val:.4f} at step {step + 1} ({(val / val_start - 1) * 100:+.1f}% since start)")
-            if cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps:
+            evaluate = cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps)
+            save = cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps
+            if schedule_free and (evaluate or save):
+                optimizer.eval()
+            if evaluate:
+                gap = validate(step + 1)
+                logging.info(f"[MOSS Trainer] validation loss {validation[-1]:.4f} at step {step + 1} ({(validation[-1] / val_start - 1) * 100:+.1f}% since start){gap}")
+            if save:
                 save_lora(state_dict(), f"{save_path}_{step + 1:06d}.safetensors", {**metadata, "ss_steps": step + 1})
                 save_state(step + 1)
+            if schedule_free and (evaluate or save):
+                optimizer.train()
+        if schedule_free:
+            optimizer.eval()
     except comfy.model_management.InterruptProcessingException:
         if step > start_step:
+            if schedule_free:
+                optimizer.eval()
             save_lora(state_dict(), f"{save_path}_{step:06d}_interrupted.safetensors", {**metadata, "ss_steps": step})
             save_state(step)
         raise

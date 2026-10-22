@@ -87,7 +87,7 @@ The training loss swings a lot from step to step because every step uses a rando
 [MOSS Trainer] validation loss 0.1214 at step 300 (-6.7% since start)
 ```
 
-A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`.
+A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`. With `reference_training` on, each line also gives the loss change when the references are left out (`+0.0123 without references`). A gap that grows over the run means the adapter is learning to use the references.
 
 ## Reference adapter
 
@@ -101,7 +101,8 @@ A steady decline means the LoRA is learning the dataset. A large drop late in th
 Character and artist names only need to be consistent within the dataset.
 
 - Every step pairs an image with one or two references. A character reference shows the same single character by another artist. A style reference is by the same artist with no shared character. A character+style reference shares both. The caption leaves out the fields the references supply, and drops the outfit half the time when the character comes from a reference. One step in ten has no references. Versions of one post and near duplicates are never paired. Model sheets are only used as references.
-- Each training image gets up to 6 caption variants. All of them are encoded once before training: about 6,300 for 1,666 images, roughly 11 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
+- To teach the adapter to read references at all, some steps use a random crop (50-80% of each side) of the image itself as its character+style reference: 30% of steps at the start of a run, tapering to 10% at the end. Validation never uses them.
+- Each training image gets up to 6 caption variants. All of them are encoded once before training: about 7,800 for 1,666 images, roughly 12.5 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
 - References run through the transformer next to the image at timestep 0. Each one only attends to itself. The image and the prompt attend to all of them. While sampling, each reference's per-block keys and values are computed once and reused every step. That takes about 0.5 GB of VRAM per 512px reference for the length of the run. A reference that doesn't fit in free VRAM is cached in RAM instead and copied in block by block, which is slower but doesn't run out of memory. The file is a normal LoRA plus `ez_moss_reference.mode_embedding`, one learned vector per mode.
 
 To generate, add one **EZ MOSS Reference** per image (`mode`, `strength`, `fidelity`) and connect them all to **EZ MOSS Apply References** together with the model, the VAE and the adapter. `strength` scales the attention paid to that reference. `fidelity` is the fraction of the sampling steps that see it, so lower values keep the broad look and leave the details to the prompt. References are scaled to about `size` x `size` pixels, 512 like the training resolution.

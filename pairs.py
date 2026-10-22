@@ -10,6 +10,10 @@ from .reference import MODES
 
 NO_REFERENCES = 0.1
 DROP_OUTFIT = 0.5
+# chance of a cropped copy of the image as its own character+style reference at the start and the end of a run,
+# an easy pairing that teaches the adapter to read references before the harder cross-image ones take over
+SELF_REFERENCE = (0.3, 0.1)
+SELF_CROP = (0.5, 0.8)
 # (weight, reference modes), the caption leaves out the fields the references supply
 PLANS = ((2, ("character",)), (3, ("style",)), (3, ("character+style",)), (3, ("character", "style")), (1, ("character", "character")), (1, ("style", "style")))
 SUPPLIES = {"character": {"character"}, "style": {"style"}, "character+style": {"character", "style"}}
@@ -25,6 +29,14 @@ def dhash(path):
 
 def caption(fields, drop):
     return " ".join(fields[k] for k in FIELDS if k not in drop and fields[k] and fields[k].lower().rstrip(".") != "none")
+
+
+def crop(latent, rng):
+    """Random crop of SELF_CROP of each side, so a self-reference is neither whole nor aligned with the image."""
+    _, h, w = latent.shape
+    ch, cw = max(1, round(h * rng.uniform(*SELF_CROP))), max(1, round(w * rng.uniform(*SELF_CROP)))
+    y, x = rng.randint(0, h - ch), rng.randint(0, w - cw)
+    return latent[:, y:y + ch, x:x + cw]
 
 
 class ReferencePairs:
@@ -68,7 +80,7 @@ class ReferencePairs:
             plans = [(w, modes) for w, modes in PLANS if all(len(refs[mode]) >= modes.count(mode) for mode in modes)]
             if m["sheet"] or not plans:
                 continue
-            drops = {frozenset()}
+            drops = {frozenset(), frozenset(SUPPLIES["character+style"]), frozenset(SUPPLIES["character+style"] | {"outfit"})}
             for _, modes in plans:
                 drop = set().union(*(SUPPLIES[mode] for mode in modes))
                 drops.add(frozenset(drop))
@@ -96,15 +108,20 @@ class ReferencePairs:
         logging.info(f"[MOSS Trainer] Caching {len(todo)} reference caption encodings ({len({p for v in self.text.values() for p in v.values()}) - len(todo)} already cached)")
         cache_texts(clip, todo, batch_size)
 
-    def sample(self, i, rng):
-        """(text encoding, [(latent, mode index)]) for training image i."""
-        plans = self.plans[i]
-        modes = () if rng.random() < NO_REFERENCES else rng.choices([p for _, p in plans], weights=[w for w, _ in plans])[0]
-        picked = []
-        for mode in modes:
-            picked.append(rng.choice([r for r in self.candidates[i][mode] if r not in picked]))
-        drop = set().union(*(SUPPLIES[mode] for mode in modes))
+    def sample(self, i, rng, progress=None):
+        """(text encoding, [(latent, mode index)]) for training image i. progress is the fraction of the run done,
+        None leaves out self-references, as validation does."""
+        if progress is not None and rng.random() < SELF_REFERENCE[0] + (SELF_REFERENCE[1] - SELF_REFERENCE[0]) * progress:
+            refs = [(crop(self.items[i]["latent"], rng), MODES.index("character+style"))]
+            drop = set(SUPPLIES["character+style"])
+        else:
+            plans = self.plans[i]
+            modes = () if rng.random() < NO_REFERENCES else rng.choices([p for _, p in plans], weights=[w for w, _ in plans])[0]
+            picked = []
+            for mode in modes:
+                picked.append(rng.choice([r for r in self.candidates[i][mode] if r not in picked]))
+            refs = [(self.items[r]["latent"], MODES.index(mode)) for r, mode in zip(picked, modes)]
+            drop = set().union(*(SUPPLIES[mode] for mode in modes))
         if "character" in drop and rng.random() < DROP_OUTFIT:
             drop.add("outfit")
-        cond = safetensors.torch.load_file(self.text[i][frozenset(drop)])["cond"]
-        return cond, [(self.items[r]["latent"], MODES.index(mode)) for r, mode in zip(picked, modes)]
+        return safetensors.torch.load_file(self.text[i][frozenset(drop)])["cond"], refs
