@@ -68,6 +68,9 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Int.Input("text_batch", default=8, min=1, max=64,
                              tooltip="Captions encoded together while caching text. 8 is about 1.6x faster than 1 on an 8 GB card and gives the same result, "
                                      "larger batches are not faster. Lower it if caching runs out of memory, 1 encodes one caption at a time."),
+                io.Boolean.Input("resume", default=False,
+                                 tooltip="Continue the run saved under output_name from its last save, interruption or end, using <output_name>.training_state. "
+                                         "Needs the same settings, steps can be raised to train longer and the seed of the saved run is used."),
             ],
             outputs=[
                 io.Custom("LORA_MODEL").Output(display_name="lora", tooltip="Trained weights, connect to Load LoRA Model to try them."),
@@ -80,7 +83,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
                 resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
-                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile, reference_training, text_batch) -> io.NodeOutput:
+                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile, reference_training, text_batch, resume) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
             raise ValueError(f"EZ MOSS Trainer needs a MOSS-Image model, got {type(model.model).__name__}.")
         if algorithm not in adapter_maps or target_layers not in TARGET_PRESETS or save_dtype not in ("bf16", "fp32"):
@@ -113,6 +116,6 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                    "reference_training": reference_training}
             logging.info(f"[MOSS Trainer] Saving to {save_path}*.safetensors")
             with torch.enable_grad():
-                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, pairs)
+                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, pairs, resume)
         return io.NodeOutput(lora, loss_map, steps)
 

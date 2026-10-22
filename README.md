@@ -76,7 +76,7 @@ When everything is cached, the text encoder and VAE are not run, and the transfo
 
 ### Output
 
-`models/loras/<output_name>.safetensors`, plus `<output_name>_<step>.safetensors` every `save_every` steps. If you cancel the queue, the current weights are saved as `<output_name>_<step>_interrupted.safetensors`. LoRA files trained on fused-qkv MOSS files are saved with split `q/k/v` keys, so they load on both fused and unfused MOSS checkpoints.
+`models/loras/<output_name>.safetensors`, plus `<output_name>_<step>.safetensors` every `save_every` steps. If you cancel the queue, the current weights are saved as `<output_name>_<step>_interrupted.safetensors`. Every save also overwrites `<output_name>.training_state` (fp32 weights, optimizer and sampler state); turn on `resume` with the same settings to continue from it, raising `steps` to train longer. LoRA files trained on fused-qkv MOSS files are saved with split `q/k/v` keys, so they load on both fused and unfused MOSS checkpoints.
 
 ### Validation loss
 

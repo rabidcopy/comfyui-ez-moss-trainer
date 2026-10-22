@@ -29,6 +29,9 @@ TARGET_PRESETS = {
     "mlp-only": {"ffn_up_gate", "ffn_down"},
 }
 
+# settings a resumed run may change, the rest must match the saved run
+RESUME_FREE = {"steps", "seed", "save_every", "log_every", "validation_every", "vram_reserve_gb", "compile", "gradient_checkpointing"}
+
 
 class LohaBypass(LohaDiff):
     # core LohaDiff only patches weights, bypass mode needs the additive h(x) = x @ dW^T
@@ -197,11 +200,25 @@ def _fmt_time(seconds):
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
-def train(mp, items, empty_cond, cfg, save_path, pairs=None):
-    """Trains bypass adapters on the MOSS transformer, with references from pairs when given. Returns (lora state dict, loss map)."""
+def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
+    """Trains bypass adapters on the MOSS transformer, with references from pairs when given. Returns (lora state dict, loss map).
+    resume continues from the training state saved next to the LoRA files at their last save."""
     device = mp.load_device
     dtype = mp.model.get_dtype_inference()
     autocast = dtype in (torch.bfloat16, torch.float16)
+
+    state_path = f"{save_path}.training_state"
+    state = None
+    if resume:
+        if not os.path.isfile(state_path):
+            raise ValueError(f"No training state to resume at {state_path}, it is written with every save of a run.")
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        changed = [k for k in cfg if k not in RESUME_FREE and cfg[k] != state["cfg"].get(k)]
+        if changed:
+            raise ValueError("Resume needs the settings of the saved run, changed: " + ", ".join(f"{k} ({state['cfg'].get(k)} -> {cfg[k]})" for k in changed))
+        cfg["seed"] = state["cfg"]["seed"]
+        logging.info(f"[MOSS Trainer] Resuming {state_path} from step {state['step']}, seed {cfg['seed']}")
+    start_step = state["step"] if state is not None else 0
 
     torch.manual_seed(cfg["seed"])
     adapters, injections = setup_adapters(mp, cfg["algorithm"], cfg["rank"], cfg["alpha"], cfg["target"])
@@ -211,6 +228,12 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
         # trained with the adapters, starts without any mode signal
         modes = torch.zeros(len(MODES), mp.model.diffusion_model.video_embedder.weight.shape[0], device=device, requires_grad=True)
         params.append(modes)
+    if state is not None:
+        for key, adapter in adapters.items():
+            adapter.load_state_dict(state["adapters"][key])
+        if modes is not None:
+            with torch.no_grad():
+                modes.copy_(state["modes"])
     logging.info(f"[MOSS Trainer] {cfg['algorithm']} on {len(adapters)} layers ({cfg['target']}), {sum(p.numel() for p in params) / 1e6:.2f}M trainable params")
 
     comfy.model_management.load_models_gpu([mp], memory_required=int(cfg["vram_reserve_gb"] * 1024 ** 3))
@@ -225,6 +248,11 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
     sampler = BucketSampler(items, cfg["batch_size"], cfg["seed"])
     generator = torch.Generator(device=device).manual_seed(cfg["seed"])
     rng = random.Random(cfg["seed"])
+    if state is not None:
+        sampler.rng.setstate(state["sampler"][0])
+        sampler.epoch, sampler.batches = state["sampler"][1:]
+        rng.setstate(state["rng"])
+        generator.set_state(state["generator"])
     model_sampling = mp.model.model_sampling
     transformer_options = mp.model_options.get("transformer_options", {}).copy()
     transformer_options["prefetch_dynamic_vbars"] = mp.is_dynamic()
@@ -247,19 +275,31 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
             sd[MODE_KEY] = modes.detach().cpu().to(node_helpers.string_to_torch_dtype(cfg["save_dtype"]))
         return sd
 
+    def save_state(step):
+        # fp32 weights, optimizer and sampling state, overwritten at every save so a run can be resumed from its last one
+        with open(state_path + ".tmp", "wb") as f:
+            torch.save({"cfg": cfg, "step": step, "adapters": {key: a.state_dict() for key, a in adapters.items()}, "modes": None if modes is None else modes.detach(),
+                        "optimizer": optimizer.state_dict(), "sampler": (sampler.rng.getstate(), sampler.epoch, sampler.batches), "rng": rng.getstate(),
+                        "generator": generator.get_state(), "loss": loss_history, "validation": validation, "validation_steps": validation_steps, "ema": ema}, f)
+            # on disk before the rename, so a power loss right after a save keeps a complete state
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(state_path + ".tmp", state_path)
+
     steps = cfg["steps"]
     metadata = {"ss_base_model_version": "moss_image", "ss_network_module": cfg["algorithm"], "ss_network_dim": cfg["rank"],
                 "ss_network_alpha": cfg["alpha"], "ez_moss_config": json.dumps(cfg)}
-    loss_history = []
-    validation = []
-    validation_steps = []
-    ema = None
+    loss_history = state["loss"] if state is not None else []
+    validation = state["validation"] if state is not None else []
+    validation_steps = state["validation_steps"] if state is not None else []
+    ema = state["ema"] if state is not None else None
     pbar = comfy.utils.ProgressBar(steps)
+    pbar.update_absolute(start_step)
     logging.info(f"[MOSS Trainer] {len(items)} images, {len(sampler)} batches per epoch, {steps} steps x {cfg['grad_accumulation']} accumulation, batch {cfg['batch_size']}")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
     start = time.perf_counter()
-    step = 0
+    step = start_step
     # the memory compiler replays per-block allocation patterns, activations kept for backward break them
     disable_compiler = args.disable_comfy_compiler
     args.disable_comfy_compiler = True
@@ -282,15 +322,19 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
             recompute_in_backward(m, [p for p in adapters[name].parameters() if p.requires_grad] if name in adapters else [])
         blocks += streamed.values()
         optimizer = make_optimizer(cfg["optimizer"], params, cfg["learning_rate"], cfg["weight_decay"], device)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps))
+        if state is not None:
+            optimizer.load_state_dict(state["optimizer"])
+        # a loaded optimizer keeps initial_lr, so the schedule picks up at start_step
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps), last_epoch=start_step - 1)
         comfy.model_management.in_training = True
         if cfg["validation_every"] > 0:
             val_set = make_validation_set(items, sample, cfg["seed"], device, dtype)
-            val_start = validation_loss(predict, val_set)
-            validation.append(val_start)
-            validation_steps.append(0)
-            logging.info(f"[MOSS Trainer] validation loss {val_start:.4f} before training ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
-        for step in range(steps):
+            if not validation:
+                validation.append(validation_loss(predict, val_set))
+                validation_steps.append(start_step)
+                logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
+            val_start = validation[0]
+        for step in range(start_step, steps):
             comfy.model_management.throw_exception_if_processing_interrupted()
             step_loss = 0.0
             for _ in range(cfg["grad_accumulation"]):
@@ -327,7 +371,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
             pbar.update(1)
             now = time.perf_counter()
             if step == 0 or (step + 1) % cfg["log_every"] == 0 or step + 1 == steps:
-                per_step = (now - start) / (step + 1)
+                per_step = (now - start) / (step + 1 - start_step)
                 vram = torch.cuda.max_memory_allocated(device) / 1024 ** 3 if torch.cuda.is_available() else 0.0
                 logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr:.2e} | grad norm {grad_norm:.3f} | "
                              f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB")
@@ -338,9 +382,11 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
                 logging.info(f"[MOSS Trainer] validation loss {val:.4f} at step {step + 1} ({(val / val_start - 1) * 100:+.1f}% since start)")
             if cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps:
                 save_lora(state_dict(), f"{save_path}_{step + 1:06d}.safetensors", {**metadata, "ss_steps": step + 1})
+                save_state(step + 1)
     except comfy.model_management.InterruptProcessingException:
-        if step > 0:
+        if step > start_step:
             save_lora(state_dict(), f"{save_path}_{step:06d}_interrupted.safetensors", {**metadata, "ss_steps": step})
+            save_state(step)
         raise
     finally:
         comfy.model_management.in_training = False
@@ -357,6 +403,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None):
 
     sd = state_dict()
     save_lora(sd, f"{save_path}.safetensors", {**metadata, "ss_steps": steps})
-    logging.info(f"[MOSS Trainer] Done: {steps} steps in {_fmt_time(time.perf_counter() - start)}, final avg loss {ema:.4f}"
+    save_state(steps)
+    logging.info(f"[MOSS Trainer] Done: {steps - start_step} steps in {_fmt_time(time.perf_counter() - start)}, final avg loss {ema:.4f}"
                  + (f", validation loss {validation[0]:.4f} -> {validation[-1]:.4f}" if validation else ""))
     return sd, {"loss": loss_history, "validation": validation, "validation_steps": validation_steps}
