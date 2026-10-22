@@ -89,13 +89,13 @@ class ReferencePairs:
         counts = {modes: sum(any(p == modes for _, p in plans) for plans in self.plans.values()) for _, modes in PLANS}
         logging.info(f"[MOSS Trainer] Reference pairs: {len(self.plans)} training images, {len(meta) - len(self.plans)} only used as references, "
                      f"{len(meta)} of {len(items)} images have a sidecar and reference fields. Images per plan: "
-                     + ", ".join(f"{' + '.join(modes)}: {c}" for modes, c in counts.items()))
+                     + ", ".join(f"{' + '.join(mode + ' ref' for mode in modes)}: {c}" for modes, c in counts.items()))
 
     def cache_text(self, clip):
         todo = {path: caption(self.fields[t], drop) for t, variants in self.text.items() for drop, path in variants.items() if not os.path.isfile(path)}
         if not todo:
             return
-        logging.info(f"[MOSS Trainer] Caching {len(todo)} reference caption encodings ({sum(len(v) for v in self.text.values()) - len(todo)} already cached)")
+        logging.info(f"[MOSS Trainer] Caching {len(todo)} reference caption encodings ({len({p for v in self.text.values() for p in v.values()}) - len(todo)} already cached)")
         pbar = comfy.utils.ProgressBar(len(todo))
         for n, (path, text) in enumerate(todo.items()):
             comfy.model_management.throw_exception_if_processing_interrupted()
