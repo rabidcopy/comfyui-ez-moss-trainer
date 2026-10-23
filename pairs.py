@@ -112,16 +112,28 @@ class ReferencePairs:
         """(text encoding, [(latent, mode index)]) for training image i. progress is the fraction of the run done,
         None leaves out self-references, as validation does."""
         if progress is not None and rng.random() < SELF_REFERENCE[0] + (SELF_REFERENCE[1] - SELF_REFERENCE[0]) * progress:
-            refs = [(crop(self.items[i]["latent"], rng), MODES.index("character+style"))]
-            drop = set(SUPPLIES["character+style"])
-        else:
-            plans = self.plans[i]
-            modes = () if rng.random() < NO_REFERENCES else rng.choices([p for _, p in plans], weights=[w for w, _ in plans])[0]
-            picked = []
-            for mode in modes:
-                picked.append(rng.choice([r for r in self.candidates[i][mode] if r not in picked]))
-            refs = [(self.items[r]["latent"], MODES.index(mode)) for r, mode in zip(picked, modes)]
-            drop = set().union(*(SUPPLIES[mode] for mode in modes))
+            return self.self_sample(i, rng)
+        plans = self.plans[i]
+        modes = () if rng.random() < NO_REFERENCES else rng.choices([p for _, p in plans], weights=[w for w, _ in plans])[0]
+        return self.plan_sample(i, modes, rng)
+
+    def has_plan(self, i, modes):
+        return any(p == modes for _, p in self.plans.get(i, ()))
+
+    def plan_sample(self, i, modes, rng):
+        """sample with references for the given modes, which must be one of image i's plans or empty."""
+        picked = []
+        for mode in modes:
+            picked.append(rng.choice([r for r in self.candidates[i][mode] if r not in picked]))
+        refs = [(self.items[r]["latent"], MODES.index(mode)) for r, mode in zip(picked, modes)]
+        return self._cond(i, set().union(*(SUPPLIES[mode] for mode in modes)), rng), refs
+
+    def self_sample(self, i, rng):
+        """sample with a random crop of image i as its own character+style reference."""
+        refs = [(crop(self.items[i]["latent"], rng), MODES.index("character+style"))]
+        return self._cond(i, set(SUPPLIES["character+style"]), rng), refs
+
+    def _cond(self, i, drop, rng):
         if "character" in drop and rng.random() < DROP_OUTFIT:
             drop.add("outfit")
-        return safetensors.torch.load_file(self.text[i][frozenset(drop)])["cond"], refs
+        return safetensors.torch.load_file(self.text[i][frozenset(drop)])["cond"]

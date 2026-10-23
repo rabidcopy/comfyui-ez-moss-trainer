@@ -87,7 +87,7 @@ The training loss swings a lot from step to step because every step uses a rando
 [MOSS Trainer] validation loss 0.1214 at step 300 (-6.7% since start)
 ```
 
-A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`. With `reference_training` on, each line also gives the loss change when the references are left out (`+0.0123 without references`). A gap that grows over the run means the adapter is learning to use the references.
+A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`. With `reference_training` on, each line also gives the loss change when the references are left out (`+0.0123 without references`). A gap that grows over the run means the adapter is learning to use the references. The validation images draw their references at random, so some reference types may not be among them. A second line therefore also measures one fixed entry per reference type (a validation image when one has that type) and `self crop`, each validation image with a crop of itself as its character+style reference. It splits the gap by noise level and by reference type. A self crop is the easiest reference, so if its gap does not grow, the adapter is not reading references at all. These extra entries are left out of the validation loss and the first gap, and roughly double the validation time.
 
 ## Reference adapter
 
