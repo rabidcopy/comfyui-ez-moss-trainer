@@ -65,23 +65,16 @@ def run_blocks(dit, x, mod, pe, vec, transformer_options):
     return x
 
 
-def with_mask(transformer_options, mask):
+def split_attention(transformer_options, n, spans, bias):
+    """The first n tokens attend to every key, each reference span only to itself. Separate unmasked calls keep SDPA on
+    its fused kernels, a mask over the joint sequence does not. bias is the first n tokens' mask, None without one."""
     override = transformer_options.get("optimized_attention_override")
 
-    def masked_attention(func, *args, **kwargs):
-        kwargs["mask"] = mask
-        return override(func, *args, **kwargs) if override is not None else func(*args, **kwargs)
-    return masked_attention
-
-
-def block_diagonal(shapes, device, dtype):
-    m = sum(h * w for h, w in shapes)
-    mask = torch.full((m, m), float("-inf"), device=device, dtype=dtype)
-    start = 0
-    for h, w in shapes:
-        mask[start:start + h * w, start:start + h * w] = 0
-        start += h * w
-    return mask
+    def attention(func, q, k, v, *args, **kwargs):
+        def call(q, k, v, mask=None):
+            return override(func, q, k, v, *args, mask=mask, **kwargs) if override is not None else func(q, k, v, *args, mask=mask, **kwargs)
+        return torch.cat([call(q[:, :n], k, v, bias)] + [call(q[:, start:end], k[:, start:end], v[:, start:end]) for start, end in spans], dim=1)
+    return attention
 
 
 def forward(dit, x, timestep, context, refs, modes, transformer_options={}):
@@ -110,15 +103,15 @@ def forward(dit, x, timestep, context, refs, modes, transformer_options={}):
     x = torch.cat((dit.video_embedder(x.flatten(2).transpose(1, 2)), txt, dit.video_embedder(ref_tokens) + ref_modes), dim=1)
     del txt, ref_tokens, ref_modes
 
-    mask = torch.zeros(n + m, n + m, device=device, dtype=dtype)
-    mask[n:, :n] = float("-inf")
-    mask[n:, n:] = block_diagonal(shapes, device, dtype)
-    start = n
-    for (_, _, strength), (h, w) in zip(refs, shapes):
-        mask[:n, start:start + h * w] = math.log(strength)
+    spans, start = [], n
+    for h, w in shapes:
+        spans.append((start, start + h * w))
         start += h * w
-    # the text embedder above attends over the text alone, only the blocks see the mask
-    transformer_options["optimized_attention_override"] = with_mask(transformer_options, mask)
+    bias = None
+    if any(strength != 1 for _, _, strength in refs):
+        bias = torch.cat([torch.zeros(n, n, device=device, dtype=dtype)] + [torch.full((n, h * w), math.log(strength), device=device, dtype=dtype) for (_, _, strength), (h, w) in zip(refs, shapes)], dim=1)
+    # the text embedder above attends over the text alone, only the blocks split the attention
+    transformer_options["optimized_attention_override"] = split_attention(transformer_options, n, spans, bias)
     x = run_blocks(dit, x, mod, pe, vec[:B], transformer_options)
 
     out = dit.final_linear_video(modulated_rms_norm(x[:, :H * W], dit.final_norm_video, head_scale, head_shift))
