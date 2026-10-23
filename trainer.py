@@ -167,15 +167,19 @@ def sample_sigmas(n, distribution, shift, generator, device):
 VALIDATION_SIGMAS = (0.25, 0.5, 0.75, 0.9)
 
 
-def make_validation_set(items, sample, seed, device, dtype):
-    """Up to 4 training images spread over the dataset, each with fixed references, noise levels and noise."""
+def validation_images(items):
+    """Up to 4 training images spread over the dataset."""
     targets = [i for i, item in enumerate(items) if item["repeats"]]
     n = min(4, len(targets))
+    return [targets[round(i * (len(targets) - 1) / max(1, n - 1))] for i in range(n)]
+
+
+def make_validation_set(items, indices, sample, seed, device, dtype):
+    """The validation images, each with fixed references, noise levels and noise."""
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     rng = random.Random(seed + 1)
     val_set = []
-    for i in range(n):
-        index = targets[round(i * (len(targets) - 1) / max(1, n - 1))]
+    for index in indices:
         x0 = items[index]["latent"][None].to(device, torch.float32)
         cond, refs = sample(index, rng)
         context = cond[None].to(device, dtype)
@@ -252,9 +256,24 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
     sampler = BucketSampler(items, cfg["batch_size"], cfg["seed"])
     generator = torch.Generator(device=device).manual_seed(cfg["seed"])
     rng = random.Random(cfg["seed"])
+    val_images = validation_images(items)
     if state is not None:
+        # saved indices point into the saved run's dataset, map them by image path so images can be added or removed
+        index = {item["image"]: i for i, item in enumerate(items)}
+        saved = state.get("images", [item["image"] for item in items])
+        moved = {j: index[path] for j, path in enumerate(saved) if path in index}
+        added = len(index.keys() - set(saved))
+        if added or len(moved) < len(saved):
+            logging.info(f"[MOSS Trainer] Dataset changed since the saved run: {added} images added, {len(saved) - len(moved)} removed. Added images join from the next epoch")
         sampler.rng.setstate(state["sampler"][0])
-        sampler.epoch, sampler.batches = state["sampler"][1:]
+        sampler.epoch = state["sampler"][1]
+        sampler.batches = [b for b in ([moved[j] for j in batch if j in moved] for batch in state["sampler"][2]) if b]
+        saved_val = state.get("validation_images", val_images)
+        kept = [moved[j] for j in saved_val if j in moved]
+        if len(kept) == len(saved_val):
+            val_images = kept
+        else:
+            logging.warning("[MOSS Trainer] A validation image was removed, validation uses new images and is not comparable with the earlier steps")
         rng.setstate(state["rng"])
         generator.set_state(state["generator"])
     model_sampling = mp.model.model_sampling
@@ -284,6 +303,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         with open(state_path + ".tmp", "wb") as f:
             torch.save({"cfg": cfg, "step": step, "adapters": {key: a.state_dict() for key, a in adapters.items()}, "modes": None if modes is None else modes.detach(),
                         "optimizer": optimizer.state_dict(), "sampler": (sampler.rng.getstate(), sampler.epoch, sampler.batches), "rng": rng.getstate(),
+                        "images": [item["image"] for item in items], "validation_images": val_images,
                         "generator": generator.get_state(), "loss": loss_history, "validation": validation, "validation_steps": validation_steps, "ema": ema}, f)
             # on disk before the rename, so a power loss right after a save keeps a complete state
             f.flush()
@@ -341,7 +361,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps), last_epoch=start_step - 1)
         comfy.model_management.in_training = True
         if cfg["validation_every"] > 0:
-            val_set = make_validation_set(items, sample, cfg["seed"], device, dtype)
+            val_set = make_validation_set(items, val_images, sample, cfg["seed"], device, dtype)
             if not validation:
                 gap = validate(start_step)
                 logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training{gap} ({len(val_set) // len(VALIDATION_SIGMAS)} images x {len(VALIDATION_SIGMAS)} noise levels)")
