@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 
@@ -237,6 +238,13 @@ class EZMOSSReference(io.ComfyNode):
         return io.NodeOutput({"image": image, "mode": MODES.index(mode), "strength": strength, "fidelity": fidelity})
 
 
+def trained_resolution(metadata):
+    """The resolution the adapter was trained at. The references are scaled to the same area, so they have the token
+    count they had during training."""
+    config = metadata.get("ez_moss_config")
+    return json.loads(config).get("resolution", 512) if config else 512
+
+
 class EZMOSSApplyReferences(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -250,8 +258,9 @@ class EZMOSSApplyReferences(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Vae.Input("vae"),
                 io.Combo.Input("adapter", options=folder_paths.get_filename_list("loras"), tooltip="Reference adapter from the loras folder."),
-                io.Int.Input("size", default=512, min=64, max=4096, step=16,
-                             tooltip="References are scaled to about size x size pixels. The trainer uses its training resolution, 512 by default."),
+                io.Int.Input("size", default=0, min=0, max=4096, step=16,
+                             tooltip="References are scaled to about size x size pixels. 0 uses the resolution the adapter was trained at, "
+                                    "the references then have the token count they had during training."),
                 io.Autogrow.Input("references", template=io.Autogrow.TemplatePrefix(
                     input=io.Custom("EZ_MOSS_REFERENCE").Input("reference"), prefix="reference_", min=0, max=16)),
             ],
@@ -260,10 +269,13 @@ class EZMOSSApplyReferences(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, vae, adapter, size, references: io.Autogrow.Type = None) -> io.NodeOutput:
-        sd = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", adapter), safe_load=True)
+        sd, metadata = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", adapter), safe_load=True, return_metadata=True)
         if MODE_KEY not in sd:
             raise ValueError(f"{adapter} is not an EZ MOSS reference adapter, train one with reference_training on.")
         modes = sd.pop(MODE_KEY)
+        if not size:
+            size = trained_resolution(metadata)
+            logging.info(f"[EZ MOSS Reference] Scaling references to {size} pixels, the resolution the adapter was trained at")
         model = comfy.sd.load_lora_for_models(model, None, sd, 1.0, 0)[0]
         refs = []
         for ref in (references or {}).values():

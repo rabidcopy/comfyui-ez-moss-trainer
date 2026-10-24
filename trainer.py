@@ -155,17 +155,24 @@ def make_lr_lambda(scheduler, warmup, steps):
     return fn
 
 
-def sample_sigmas(n, distribution, shift, generator, device):
+def sample_sigmas(n, distribution, shift, generator, device, floor=None):
     if distribution == "logit_normal":
         sigma = torch.randn(n, generator=generator, device=device).sigmoid()
     else:
         sigma = torch.rand(n, generator=generator, device=device)
+    if floor is not None:
+        # the target's own latent carries the identity below this noise level, the reference cannot be its source there
+        # and training on it teaches the model to leave the reference alone
+        sigma = floor + (1.0 - floor) * sigma
     sigma = shift * sigma / (1 + (shift - 1) * sigma)
     # OneTrainer's discrete grid starts at 1/1000
     return sigma.clamp(1e-3, 1.0)
 
 
 VALIDATION_SIGMAS = (0.25, 0.5, 0.75, 0.9)
+# a step with references trains on noise levels above this, the target's own latent only stops carrying the identity
+# above it and the reference has to be the source of the identity in the rest of the run
+REFERENCE_SIGMA_FLOOR = 0.7
 
 
 def validation_images(items):
@@ -176,6 +183,7 @@ def validation_images(items):
 
 
 SELF_LABEL = "self crop"
+WRONG_LABEL = "wrong ref"
 
 
 def validation_plans(pairs, indices):
@@ -193,7 +201,9 @@ def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtyp
 
     With pairs, each image also gets an entry with a crop of itself as the reference, and each of plans an entry with that
     plan's references. Those draw from their own random states, so the other entries match runs without them, and they are
-    left out of the validation loss."""
+    left out of the validation loss. A plan with a character reference also gets an entry with another character's
+    reference on the same noise: an adapter that binds the identity cannot gain from it, one that copies its reference
+    does."""
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     rng = random.Random(seed + 1)
     self_generator = torch.Generator(device=device).manual_seed(seed + 2)
@@ -202,12 +212,15 @@ def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtyp
     plan_rng = random.Random(seed + 3)
     val_set = []
 
-    def add(index, cond, refs, label, generator, main=False):
+    def add(index, cond, refs, label, generator, main=False, noises=None):
         x0 = items[index]["latent"][None].to(device, torch.float32)
         context = cond[None].to(device, dtype)
         refs = [(latent[None].to(device, dtype), mode, 1.0) for latent, mode in refs]
-        for sigma in VALIDATION_SIGMAS:
-            val_set.append((x0, context, refs, torch.randn(x0.shape, generator=generator, device=device), torch.tensor([sigma], device=device), label, main))
+        if noises is None:
+            noises = [torch.randn(x0.shape, generator=generator, device=device) for _ in VALIDATION_SIGMAS]
+        for noise, sigma in zip(noises, VALIDATION_SIGMAS):
+            val_set.append((x0, context, refs, noise, torch.tensor([sigma], device=device), label, main))
+        return noises
 
     for index in indices:
         cond, refs = sample(index, rng)
@@ -215,7 +228,12 @@ def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtyp
         if pairs is not None:
             add(index, *pairs.self_sample(index, self_rng), SELF_LABEL, self_generator)
     for modes, index in plans:
-        add(index, *pairs.plan_sample(index, modes, plan_rng), " + ".join(modes), plan_generator)
+        cond, refs = pairs.plan_sample(index, modes, plan_rng)
+        noises = add(index, cond, refs, " + ".join(modes), plan_generator)
+        if "character" in modes:
+            wrong = pairs.wrong_reference(index, plan_rng)
+            if wrong is not None:
+                add(index, cond, [(wrong, MODES.index("character"))], WRONG_LABEL, plan_generator, noises=noises)
     return val_set
 
 
@@ -357,8 +375,8 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         def mean_gap(keep):
             values = [gap for entry, gap in gaps if keep(entry)]
             return sum(values) / len(values)
-        by_noise = ", ".join(f"{sigma} {mean_gap(lambda e: e[5] != SELF_LABEL and math.isclose(e[4].item(), sigma, rel_tol=1e-6)):+.4f}" for sigma in VALIDATION_SIGMAS)
-        labels = [" + ".join(modes) for _, modes in PLANS] + [SELF_LABEL]
+        by_noise = ", ".join(f"{sigma} {mean_gap(lambda e: e[5] not in (SELF_LABEL, WRONG_LABEL) and math.isclose(e[4].item(), sigma, rel_tol=1e-6)):+.4f}" for sigma in VALIDATION_SIGMAS)
+        labels = [" + ".join(modes) for _, modes in PLANS] + [SELF_LABEL, WRONG_LABEL]
         by_modes = ", ".join(f"{label} {mean_gap(lambda e: e[5] == label):+.4f}" for label in labels if any(e[5] == label for e, _ in gaps))
         total = sum(gap for entry, gap in gaps if entry[6]) / main
         return f", {total:+.4f} without references", f"[MOSS Trainer]   without references by noise level: {by_noise} | by references: {by_modes}"
@@ -433,7 +451,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
                     context = torch.stack([c for _, c, _ in group]).to(device, dtype)
                     refs = [(latent[None].to(device, dtype), mode, 1.0) for latent, mode in group[0][2]]
                     noise = torch.randn(x0.shape, generator=generator, device=device)
-                    sigma = sample_sigmas(len(group), cfg["timestep_distribution"], cfg["timestep_shift"], generator, device)
+                    sigma = sample_sigmas(len(group), cfg["timestep_distribution"], cfg["timestep_shift"], generator, device, REFERENCE_SIGMA_FLOOR if refs else None)
                     s = sigma.view(-1, 1, 1, 1)
                     pred = predict((1 - s) * x0 + s * noise, sigma, context, refs)
                     loss = torch.nn.functional.mse_loss(pred.float(), noise - x0)

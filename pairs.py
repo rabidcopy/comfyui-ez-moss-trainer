@@ -18,6 +18,27 @@ SELF_CROP = (0.5, 0.8)
 PLANS = ((2, ("character",)), (3, ("style",)), (3, ("character+style",)), (3, ("character", "style")), (1, ("character", "character")), (1, ("style", "style")))
 SUPPLIES = {"character": {"character"}, "style": {"style"}, "character+style": {"character", "style"}}
 FIELDS = ("character", "outfit", "scene", "style")
+# chance that the caption keeps the field a reference supplies. The character field describes the character's look in
+# words, a reference shows it. Leaving it out every time teaches the model that a caption without the field means the
+# reference has to be read, and every prompt at inference has one.
+KEEP_FIELD = 0.5
+
+
+def supplied_fields(modes):
+    return set().union(*(SUPPLIES[mode] for mode in modes)) if modes else set()
+
+
+def drop_variants(modes):
+    """The caption variants a plan trains on: the fields the references supply are left out, and kept the other half of
+    the time. A character reference drops the outfit too, the reference shows the outfit it wants."""
+    supplied = supplied_fields(modes)
+    variants = {frozenset(supplied)}
+    kept = supplied - {"character"} if "character" in supplied else supplied - {"style"}
+    variants.add(frozenset(kept))
+    if "character" in supplied:
+        variants.add(frozenset(supplied | {"outfit"}))
+        variants.add(frozenset(kept | {"outfit"}))
+    return variants
 
 
 def dhash(path):
@@ -72,6 +93,7 @@ class ReferencePairs:
             return not meta[a]["related"] & meta[b]["related"] and (meta[a]["hash"] ^ meta[b]["hash"]).bit_count() > 10
 
         self.fields, self.candidates, self.plans, self.text = {}, {}, {}, {}
+        self.meta = meta
         for t, m in meta.items():
             same = by_character.get(m["characters"][0], []) if len(m["characters"]) == 1 and m["fields"]["visible"] != "no" else []
             refs = {"character": [r for r in same if meta[r]["artist"] != m["artist"] and distinct(t, r)],
@@ -82,10 +104,7 @@ class ReferencePairs:
                 continue
             drops = {frozenset(), frozenset(SUPPLIES["character+style"]), frozenset(SUPPLIES["character+style"] | {"outfit"})}
             for _, modes in plans:
-                drop = set().union(*(SUPPLIES[mode] for mode in modes))
-                drops.add(frozenset(drop))
-                if "character" in drop:
-                    drops.add(frozenset(drop | {"outfit"}))
+                drops |= drop_variants(modes)
             self.fields[t] = m["fields"]
             self.candidates[t] = refs
             self.plans[t] = plans
@@ -126,14 +145,39 @@ class ReferencePairs:
         for mode in modes:
             picked.append(rng.choice([r for r in self.candidates[i][mode] if r not in picked]))
         refs = [(self.items[r]["latent"], MODES.index(mode)) for r, mode in zip(picked, modes)]
-        return self._cond(i, set().union(*(SUPPLIES[mode] for mode in modes)), rng), refs
+        return self._cond(i, self._drop(modes, rng)), refs
 
     def self_sample(self, i, rng):
         """sample with a random crop of image i as its own character+style reference."""
         refs = [(crop(self.items[i]["latent"], rng), MODES.index("character+style"))]
-        return self._cond(i, set(SUPPLIES["character+style"]), rng), refs
-
-    def _cond(self, i, drop, rng):
-        if "character" in drop and rng.random() < DROP_OUTFIT:
+        drop = set(SUPPLIES["character+style"])
+        if rng.random() < DROP_OUTFIT:
             drop.add("outfit")
+        return self._cond(i, drop), refs
+
+    def wrong_reference(self, i, rng):
+        """The latent of another character, for the validation entry that tells identity binding from copying. None when
+        the dataset has no other character."""
+        chars = set(self.meta[i]["characters"])
+        related = self.meta[i]["related"]
+        pool = [r for r, m in self.meta.items()
+                if len(m["characters"]) == 1 and not chars & set(m["characters"]) and not related & m["related"]]
+        if not pool:
+            return None
+        return self.items[rng.choice(pool)]["latent"]
+
+    def _drop(self, modes, rng):
+        """The fields the caption leaves out. The fields the references supply are left out most of the time and kept the
+        rest, so the caption alone does not tell the model whether it has to read the reference."""
+        supplied = supplied_fields(modes)
+        if not supplied:
+            return set()
+        drop = supplied
+        if rng.random() < KEEP_FIELD:
+            drop = supplied - {"character"} if "character" in supplied else supplied - {"style"}
+        if "character" in supplied and rng.random() < DROP_OUTFIT:
+            drop.add("outfit")
+        return drop
+
+    def _cond(self, i, drop):
         return safetensors.torch.load_file(self.text[i][frozenset(drop)])["cond"]
