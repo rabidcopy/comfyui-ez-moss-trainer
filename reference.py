@@ -71,6 +71,8 @@ def split_attention(transformer_options, n, spans, bias):
     override = transformer_options.get("optimized_attention_override")
 
     def attention(func, q, k, v, *args, **kwargs):
+        # the caller passes its own mask, ours replaces it: the target's bias or none
+        kwargs.pop("mask", None)
         def call(q, k, v, mask=None):
             return override(func, q, k, v, *args, mask=mask, **kwargs) if override is not None else func(q, k, v, *args, mask=mask, **kwargs)
         return torch.cat([call(q[:, :n], k, v, bias)] + [call(q[:, start:end], k[:, start:end], v[:, start:end]) for start, end in spans], dim=1)
