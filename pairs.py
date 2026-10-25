@@ -99,6 +99,11 @@ class ReferencePairs:
             drops = {frozenset(), frozenset(SUPPLIES["character+style"]), frozenset(SUPPLIES["character+style"] | {"outfit"})}
             for _, modes in plans:
                 drops |= drop_variants(modes)
+            # self_sample pairs an image with its easiest reference mode, whatever plans it trains
+            if refs["character+style"]:
+                drops |= drop_variants(("character+style",))
+            elif refs["character"]:
+                drops |= drop_variants(("character",))
             self.fields[t] = m["fields"]
             self.candidates[t] = refs
             self.plans[t] = plans
