@@ -481,8 +481,9 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         # saved states hold the schedule-free evaluation weights, training steps from the training weights
         if schedule_free:
             optimizer.train()
-        for step in range(start_step, steps):
-            comfy.model_management.throw_exception_if_processing_interrupted()
+
+        def accumulate():
+            optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             for _ in range(cfg["grad_accumulation"]):
                 batch = sampler.next()
@@ -514,6 +515,32 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
                             loss = loss + torch.relu(mse_wrong - loss - CONTRASTIVE_MARGIN * mse_wrong.detach())
                     (loss * len(group) / len(batch) / cfg["grad_accumulation"]).backward()
                     step_loss += loss.item() * len(group) / len(batch) / cfg["grad_accumulation"]
+            return step_loss
+
+        for step in range(start_step, steps):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            # dynamic VRAM's paging blobs live outside the allocator, so an OOM leaves nothing releasable;
+            # rewind the samplers and noisemakers and replay the identical step once on an emptied cache
+            replay = (generator.get_state(), sampler.rng.getstate(), sampler.epoch, list(sampler.batches), rng.getstate())
+            try:
+                step_loss = accumulate()
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                generator.set_state(replay[0])
+                sampler.rng.setstate(replay[1])
+                sampler.epoch = replay[2]
+                sampler.batches = replay[3]
+                rng.setstate(replay[4])
+                try:
+                    step_loss = accumulate()
+                except torch.OutOfMemoryError:
+                    if schedule_free:
+                        optimizer.eval()
+                    if step > start_step:
+                        save_lora(state_dict(), f"{save_path}_{step:06d}_interrupted.safetensors", {**metadata, "ss_steps": step})
+                        save_state(step)
+                    logging.warning("[MOSS Trainer] Out of VRAM twice on one step, the run is saved as interrupted. Train at lower peak resolutions, or close other GPU apps, and queue again")
+                    raise
             if cfg["max_grad_norm"] > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg["max_grad_norm"]).item()
             else:
@@ -530,8 +557,10 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
             if step == 0 or (step + 1) % cfg["log_every"] == 0 or step + 1 == steps:
                 per_step = (now - start) / (step + 1 - start_step)
                 vram = torch.cuda.max_memory_allocated(device) / 1024 ** 3 if torch.cuda.is_available() else 0.0
+                # the paging blobs of dynamic VRAM sit outside the allocator, so report what CUDA sees too
+                free = torch.cuda.mem_get_info(device)[0] / 1024 ** 3 if torch.cuda.is_available() else 1.0
                 logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr:.2e} | grad norm {grad_norm:.3f} | "
-                             f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB")
+                             f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB | device free {free:.2f} GB")
             evaluate = cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps)
             save = cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps
             if schedule_free and (evaluate or save):
@@ -567,6 +596,8 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
             injection.eject(mp)
         # the weights were moved outside inference mode, unload so the next prompt reloads them cleanly
         comfy.model_management.unload_model_and_clones(mp)
+        # hand the reserved but free segments back, otherwise the process keeps them scored against every later load
+        torch.cuda.empty_cache()
 
     sd = state_dict()
     save_lora(sd, f"{save_path}.safetensors", {**metadata, "ss_steps": steps})
