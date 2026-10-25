@@ -261,7 +261,7 @@ class EZMOSSApplyReferences(io.ComfyNode):
                 io.Vae.Input("vae"),
                 io.Combo.Input("adapter", options=folder_paths.get_filename_list("loras"), tooltip="Reference adapter from the loras folder."),
                 io.Int.Input("size", default=0, min=0, max=4096, step=16,
-                             tooltip="References are scaled to about size x size pixels. 0 uses the resolution the adapter was trained at, "
+                             tooltip="References are scaled to about size x size pixels. 0 uses the resolution the adapter was trained at (the largest of the list for multi-resolution adapters), "
                                     "the references then have the token count they had during training."),
                 io.Autogrow.Input("references", template=io.Autogrow.TemplatePrefix(
                     input=io.Custom("EZ_MOSS_REFERENCE").Input("reference"), prefix="reference_", min=0, max=16)),
