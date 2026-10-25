@@ -10,10 +10,9 @@ from .reference import MODES
 
 NO_REFERENCES = 0.1
 DROP_OUTFIT = 0.5
-# chance of a cropped copy of the image as its own character+style reference at the start and the end of a run,
-# an easy pairing that teaches the adapter to read references before the harder cross-image ones take over
+# chance of another image of the same character as the reference at the start and the end of a run, an easy pairing that
+# teaches the adapter to read references before the harder cross-image ones take over
 SELF_REFERENCE = (0.3, 0.1)
-SELF_CROP = (0.5, 0.8)
 # (weight, reference modes), the caption leaves out the fields the references supply
 PLANS = ((2, ("character",)), (3, ("style",)), (3, ("character+style",)), (3, ("character", "style")), (1, ("character", "character")), (1, ("style", "style")))
 SUPPLIES = {"character": {"character"}, "style": {"style"}, "character+style": {"character", "style"}}
@@ -52,23 +51,18 @@ def caption(fields, drop):
     return " ".join(fields[k] for k in FIELDS if k not in drop and fields[k] and fields[k].lower().rstrip(".") != "none")
 
 
-def crop(latent, rng):
-    """Random crop of SELF_CROP of each side, so a self-reference is neither whole nor aligned with the image."""
-    _, h, w = latent.shape
-    ch, cw = max(1, round(h * rng.uniform(*SELF_CROP))), max(1, round(w * rng.uniform(*SELF_CROP)))
-    y, x = rng.randint(0, h - ch), rng.randint(0, w - cw)
-    return latent[:, y:y + ch, x:x + cw]
-
-
 class ReferencePairs:
     """References for images with a .json sidecar (artist, characters, sheet, related) captioned with the 'reference fields (JSON)' preset.
 
     Character references show the same single character by another artist, style references are by the same artist
     with no shared character, character+style references share both. Versions of one post and near duplicates are never
-    paired. Model sheets and images without any reference are only used as references."""
+    paired. Model sheets and images without any reference are only used as references.
 
-    def __init__(self, items):
+    plan_filter is a comma separated list of the plans to train, empty for all of them."""
+
+    def __init__(self, items, plan_filter=""):
         self.items = items
+        allowed = {name.strip() for name in plan_filter.split(",") if name.strip()}
         meta = {}
         for i, item in enumerate(items):
             sidecar = os.path.splitext(item["image"])[0] + ".json"
@@ -99,7 +93,7 @@ class ReferencePairs:
             refs = {"character": [r for r in same if meta[r]["artist"] != m["artist"] and distinct(t, r)],
                     "style": [r for r in by_artist[m["artist"]] if not set(meta[r]["characters"]) & set(m["characters"]) and distinct(t, r)],
                     "character+style": [r for r in same if meta[r]["artist"] == m["artist"] and distinct(t, r)]}
-            plans = [(w, modes) for w, modes in PLANS if all(len(refs[mode]) >= modes.count(mode) for mode in modes)]
+            plans = [(w, modes) for w, modes in PLANS if (not allowed or " + ".join(modes) in allowed) and all(len(refs[mode]) >= modes.count(mode) for mode in modes)]
             if m["sheet"] or not plans:
                 continue
             drops = {frozenset(), frozenset(SUPPLIES["character+style"]), frozenset(SUPPLIES["character+style"] | {"outfit"})}
@@ -118,7 +112,8 @@ class ReferencePairs:
         counts = {modes: sum(any(p == modes for _, p in plans) for plans in self.plans.values()) for _, modes in PLANS}
         logging.info(f"[MOSS Trainer] Reference pairs: {len(self.plans)} training images, {len(meta) - len(self.plans)} only used as references, "
                      f"{len(meta)} of {len(items)} images have a sidecar and reference fields. Images per plan: "
-                     + ", ".join(f"{' + '.join(mode + ' ref' for mode in modes)}: {c}" for modes, c in counts.items()))
+                     + ", ".join(f"{' + '.join(mode + ' ref' for mode in modes)}: {c}" for modes, c in counts.items())
+                     + (f" | training only: {', '.join(sorted(allowed))}" if allowed else ""))
 
     def cache_text(self, clip, batch_size):
         todo = {path: caption(self.fields[t], drop) for t, variants in self.text.items() for drop, path in variants.items() if not os.path.isfile(path)}
@@ -148,20 +143,29 @@ class ReferencePairs:
         return self._cond(i, self._drop(modes, rng)), refs
 
     def self_sample(self, i, rng):
-        """sample with a random crop of image i as its own character+style reference."""
-        refs = [(crop(self.items[i]["latent"], rng), MODES.index("character+style"))]
-        drop = set(SUPPLIES["character+style"])
-        if rng.random() < DROP_OUTFIT:
-            drop.add("outfit")
-        return self._cond(i, drop), refs
+        """sample with an easy reference for image i: another image of the same character, by the same artist when there
+        is one. A crop of the image itself would be easier still, but the model can paste that into the output instead of
+        reading it."""
+        for mode in ("character+style", "character"):
+            candidates = self.candidates.get(i, {}).get(mode, [])
+            if candidates:
+                r = rng.choice(candidates)
+                return self._cond(i, self._drop((mode,), rng)), [(self.items[r]["latent"], MODES.index(mode))]
+        return self._cond(i, set()), []
 
-    def wrong_reference(self, i, rng):
-        """The latent of another character, for the validation entry that tells identity binding from copying. None when
-        the dataset has no other character."""
+    def wrong_reference(self, i, rng, mode="character"):
+        """The latent of another character, for the entry that tells identity binding from copying. It is the same kind of
+        reference as the one it replaces, a character+style reference keeps the artist, so only the character differs.
+        None when the dataset has no other character."""
         chars = set(self.meta[i]["characters"])
         related = self.meta[i]["related"]
+        artist = self.meta[i]["artist"]
         pool = [r for r, m in self.meta.items()
-                if len(m["characters"]) == 1 and not chars & set(m["characters"]) and not related & m["related"]]
+                if len(m["characters"]) == 1 and not chars & set(m["characters"]) and not related & m["related"]
+                and (m["artist"] == artist) == (mode == "character+style")]
+        if not pool:
+            pool = [r for r, m in self.meta.items()
+                    if len(m["characters"]) == 1 and not chars & set(m["characters"]) and not related & m["related"]]
         if not pool:
             return None
         return self.items[rng.choice(pool)]["latent"]

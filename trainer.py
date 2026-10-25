@@ -173,6 +173,13 @@ VALIDATION_SIGMAS = (0.25, 0.5, 0.75, 0.9)
 # a step with references trains on noise levels above this, the target's own latent only stops carrying the identity
 # above it and the reference has to be the source of the identity in the rest of the run
 REFERENCE_SIGMA_FLOOR = 0.7
+# share of the steps with references that also run the same target with another character's reference. The correct
+# reference has to make the prediction better than the wrong one, otherwise the model is free to ignore it.
+CONTRASTIVE = 0.25
+# how much better the correct reference has to be, as a share of the wrong reference's loss
+CONTRASTIVE_MARGIN = 0.05
+# share of the reference token's own scale that the mode vector starts at, it has to be a signal and not a rounding error
+MODE_SCALE = 0.1
 
 
 def validation_images(items):
@@ -182,7 +189,7 @@ def validation_images(items):
     return [targets[round(i * (len(targets) - 1) / max(1, n - 1))] for i in range(n)]
 
 
-SELF_LABEL = "self crop"
+PARTNER_LABEL = "partner"
 WRONG_LABEL = "wrong ref"
 
 
@@ -199,11 +206,13 @@ def validation_plans(pairs, indices):
 def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtype):
     """The validation images, each with fixed references, noise levels and noise, labelled with their reference modes.
 
-    With pairs, each image also gets an entry with a crop of itself as the reference, and each of plans an entry with that
-    plan's references. Those draw from their own random states, so the other entries match runs without them, and they are
-    left out of the validation loss. A plan with a character reference also gets an entry with another character's
-    reference on the same noise: an adapter that binds the identity cannot gain from it, one that copies its reference
-    does."""
+    With pairs, each image also gets an entry with another image of the same character as the reference, and each of plans
+    an entry with that plan's references. Those draw from their own random states, so the other entries match runs
+    without them, and they are left out of the validation loss. A plan with a character reference also gets an entry with
+    another character's reference on the same noise: an adapter that binds the identity has to make the correct reference
+    better than the wrong one, one that copies its reference does not.
+
+    Returns the entries and the (correct, wrong) index pairs of those entries."""
     generator = torch.Generator(device=device).manual_seed(seed + 1)
     rng = random.Random(seed + 1)
     self_generator = torch.Generator(device=device).manual_seed(seed + 2)
@@ -211,6 +220,7 @@ def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtyp
     plan_generator = torch.Generator(device=device).manual_seed(seed + 3)
     plan_rng = random.Random(seed + 3)
     val_set = []
+    ref_pairs = []
 
     def add(index, cond, refs, label, generator, main=False, noises=None):
         x0 = items[index]["latent"][None].to(device, torch.float32)
@@ -218,23 +228,31 @@ def make_validation_set(items, indices, plans, sample, pairs, seed, device, dtyp
         refs = [(latent[None].to(device, dtype), mode, 1.0) for latent, mode in refs]
         if noises is None:
             noises = [torch.randn(x0.shape, generator=generator, device=device) for _ in VALIDATION_SIGMAS]
+        first = len(val_set)
         for noise, sigma in zip(noises, VALIDATION_SIGMAS):
             val_set.append((x0, context, refs, noise, torch.tensor([sigma], device=device), label, main))
-        return noises
+        return first, noises
 
     for index in indices:
         cond, refs = sample(index, rng)
         add(index, cond, refs, " + ".join(MODES[mode] for _, mode in refs), generator, main=True)
         if pairs is not None:
-            add(index, *pairs.self_sample(index, self_rng), SELF_LABEL, self_generator)
+            add(index, *pairs.self_sample(index, self_rng), PARTNER_LABEL, self_generator)
     for modes, index in plans:
         cond, refs = pairs.plan_sample(index, modes, plan_rng)
-        noises = add(index, cond, refs, " + ".join(modes), plan_generator)
-        if "character" in modes:
-            wrong = pairs.wrong_reference(index, plan_rng)
+        first, noises = add(index, cond, refs, " + ".join(modes), plan_generator)
+        # the same reference with another character in it, everything else the same
+        for n, (_, mode) in enumerate(refs):
+            if mode == MODES.index("style"):
+                continue
+            wrong = pairs.wrong_reference(index, plan_rng, MODES[mode])
             if wrong is not None:
-                add(index, cond, [(wrong, MODES.index("character"))], WRONG_LABEL, plan_generator, noises=noises)
-    return val_set
+                wrong_refs = list(refs)
+                wrong_refs[n] = (wrong, mode)
+                wrong_first, _ = add(index, cond, wrong_refs, WRONG_LABEL, plan_generator, noises=noises)
+                ref_pairs.append((first, wrong_first))
+                break
+    return val_set, ref_pairs
 
 
 def entry_loss(predict, entry, use_refs=True):
@@ -275,8 +293,11 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
     params = [p for a in adapters.values() for p in a.parameters() if p.requires_grad]
     modes = None
     if pairs is not None:
-        # trained with the adapters, starts without any mode signal
-        modes = torch.zeros(len(MODES), mp.model.diffusion_model.video_embedder.weight.shape[0], device=device, requires_grad=True)
+        # The mode vector is added to the reference's tokens and tells the model what to take from them. It has to be a
+        # real signal next to the token embeddings, a zero vector leaves the model with no way to tell a character
+        # reference from a style one and it can only learn to copy the reference or ignore it.
+        latent_std = float(items[0]["latent"].float().std())
+        modes = (torch.randn(len(MODES), mp.model.diffusion_model.video_embedder.weight.shape[0], device=device) * latent_std * MODE_SCALE).requires_grad_(True)
         params.append(modes)
     if state is not None:
         for key, adapter in adapters.items():
@@ -287,6 +308,13 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
     logging.info(f"[MOSS Trainer] {cfg['algorithm']} on {len(adapters)} layers ({cfg['target']}), {sum(p.numel() for p in params) / 1e6:.2f}M trainable params")
 
     comfy.model_management.load_models_gpu([mp], memory_required=int(cfg["vram_reserve_gb"] * 1024 ** 3))
+    if modes is not None:
+        # the mode vector only means something next to the size of the tokens it is added to
+        embedder = mp.model.diffusion_model.video_embedder
+        probe = torch.randn(1, 64, items[0]["latent"].shape[0], device=device, dtype=dtype) * latent_std
+        token_rms = float(embedder(probe).float().pow(2).mean().sqrt())
+        mode_rms = float(modes.detach().float().pow(2).mean().sqrt())
+        logging.info(f"[MOSS Trainer] Reference mode vectors start at {mode_rms:.4f}, the reference tokens they are added to at {token_rms:.4f}")
     if mp.is_dynamic():
         logging.info(f"[MOSS Trainer] Dynamic VRAM: {mp.model_size() / 1024 ** 3:.2f} GB of transformer weights are paged in per block")
     else:
@@ -358,8 +386,9 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         os.replace(state_path + ".tmp", state_path)
 
     def validate(step):
-        """Appends the validation loss of the main entries. Returns the log text for their loss change without references,
-        and a line breaking the change of every entry down by noise level (self crops left out) and by reference modes."""
+        """Appends the validation loss of the main entries. Returns the log text for their loss change without references
+        and how much worse the wrong reference is than the correct one, and a line breaking the change of every entry down
+        by noise level (the partner and wrong reference entries left out) and by reference modes."""
         main = sum(entry[6] for entry in val_set)
         with torch.no_grad():
             losses = [entry_loss(predict, entry) for entry in val_set]
@@ -375,11 +404,19 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         def mean_gap(keep):
             values = [gap for entry, gap in gaps if keep(entry)]
             return sum(values) / len(values)
-        by_noise = ", ".join(f"{sigma} {mean_gap(lambda e: e[5] not in (SELF_LABEL, WRONG_LABEL) and math.isclose(e[4].item(), sigma, rel_tol=1e-6)):+.4f}" for sigma in VALIDATION_SIGMAS)
-        labels = [" + ".join(modes) for _, modes in PLANS] + [SELF_LABEL, WRONG_LABEL]
+        # how much worse the wrong reference is than the correct one on the same target, caption and noise. The gap above
+        # is dominated by the reference's style, this is the identity alone.
+        margins = [losses[w + j] - losses[c + j] for c, w in ref_pairs for j in range(len(VALIDATION_SIGMAS))]
+        margin = sum(margins) / len(margins) if margins else 0.0
+        by_noise = ", ".join(f"{sigma} {mean_gap(lambda e: e[5] not in (PARTNER_LABEL, WRONG_LABEL) and math.isclose(e[4].item(), sigma, rel_tol=1e-6)):+.4f}" for sigma in VALIDATION_SIGMAS)
+        labels = [" + ".join(modes) for _, modes in PLANS] + [PARTNER_LABEL, WRONG_LABEL]
         by_modes = ", ".join(f"{label} {mean_gap(lambda e: e[5] == label):+.4f}" for label in labels if any(e[5] == label for e, _ in gaps))
         total = sum(gap for entry, gap in gaps if entry[6]) / main
-        return f", {total:+.4f} without references", f"[MOSS Trainer]   without references by noise level: {by_noise} | by references: {by_modes}"
+        by_sigma = ", ".join(f"{sigma} {sum(losses[w + j] - losses[c + j] for c, w in ref_pairs) / len(ref_pairs):+.4f}" for j, sigma in enumerate(VALIDATION_SIGMAS)) if ref_pairs else ""
+        detail = f"[MOSS Trainer]   without references by noise level: {by_noise} | by references: {by_modes}"
+        if by_sigma:
+            detail += f" | wrong reference margin by noise level: {by_sigma}"
+        return f", {total:+.4f} without references, {margin:+.4f} wrong reference margin", detail
 
     steps = cfg["steps"]
     schedule_free = cfg["optimizer"] == "Prodigy"
@@ -424,7 +461,7 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps), last_epoch=start_step - 1)
         comfy.model_management.in_training = True
         if cfg["validation_every"] > 0:
-            val_set = make_validation_set(items, val_images, val_plans, sample, pairs, cfg["seed"], device, dtype)
+            val_set, ref_pairs = make_validation_set(items, val_images, val_plans, sample, pairs, cfg["seed"], device, dtype)
             if not validation:
                 gap, detail = validate(start_step)
                 logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training{gap} ({len(val_images)} images x {len(VALIDATION_SIGMAS)} noise levels)")
@@ -455,6 +492,16 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
                     s = sigma.view(-1, 1, 1, 1)
                     pred = predict((1 - s) * x0 + s * noise, sigma, context, refs)
                     loss = torch.nn.functional.mse_loss(pred.float(), noise - x0)
+                    if refs and rng.random() < CONTRASTIVE:
+                        # the same target with another character's reference in place of the first character reference. It
+                        # has to make the prediction worse, which only happens when the model reads the reference.
+                        index = next((n for n, (_, mode, _) in enumerate(refs) if mode != MODES.index("style")), None)
+                        wrong = pairs.wrong_reference(group[0][0], rng, MODES[refs[index][1]]) if index is not None else None
+                        if wrong is not None:
+                            wrong_refs = list(refs)
+                            wrong_refs[index] = (wrong[None].to(device, dtype), refs[index][1], refs[index][2])
+                            mse_wrong = torch.nn.functional.mse_loss(predict((1 - s) * x0 + s * noise, sigma, context, wrong_refs).float(), noise - x0)
+                            loss = loss + torch.relu(mse_wrong - loss - CONTRASTIVE_MARGIN * mse_wrong.detach())
                     (loss * len(group) / len(batch) / cfg["grad_accumulation"]).backward()
                     step_loss += loss.item() * len(group) / len(batch) / cfg["grad_accumulation"]
             if cfg["max_grad_norm"] > 0:
