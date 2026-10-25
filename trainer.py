@@ -134,7 +134,10 @@ def make_optimizer(name, params, lr, weight_decay, device):
     if name == "AdamW":
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
     if name == "Prodigy":
-        return ProdigyPlusScheduleFree(params, lr=lr, weight_decay=weight_decay)
+        # the library default d0=1e-6 never takes off here: with one random sigma and noise per batch the
+        # per-step gradient aligns with the accumulated weights too little for d to grow, so the run trains
+        # d0 times too slowly. 1e-4 picks up like AdamW at 3e-4 with batch_size 2.
+        return ProdigyPlusScheduleFree(params, lr=lr, weight_decay=weight_decay, d0=1e-4)
     if name == "Adafactor":
         return torch.optim.Adafactor(params, lr=lr, weight_decay=weight_decay)
     if name == "SGD":
@@ -457,6 +460,13 @@ def train(mp, items, empty_cond, cfg, save_path, pairs=None, resume=False):
         optimizer = make_optimizer(cfg["optimizer"], params, cfg["learning_rate"], cfg["weight_decay"], device)
         if state is not None:
             optimizer.load_state_dict(state["optimizer"])
+            if cfg["optimizer"] == "Prodigy":
+                # states written before the d0 bump carry the estimate Prodigy stalled on; Prodigy only
+                # ever raises d, so without this a resumed run trains at the saved one forever
+                for group in optimizer.param_groups:
+                    group["d0"] = 1e-4
+                    if group["d"] < group["d0"]:
+                        group["d"] = group["d0"]
         # a loaded optimizer keeps initial_lr, so the schedule picks up at start_step
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps), last_epoch=start_step - 1)
         comfy.model_management.in_training = True
