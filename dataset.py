@@ -53,18 +53,32 @@ def scan_folder(folder):
     return items, missing
 
 
-def make_buckets(resolution, enabled):
+def parse_resolutions(text):
+    """`512` or `512,768,1024` in any order, with duplicates and spaces dropped. Returns a sorted list."""
+    resolutions = sorted({int(r) for r in str(text).replace(";", ",").split(",") if r.strip()})
+    if not resolutions:
+        raise ValueError("No resolution given. Use 512 or a comma separated list like 512,768,1024.")
+    for r in resolutions:
+        if r < 2 * BUCKET_STEP or r % BUCKET_STEP or r > 4096:
+            raise ValueError(f"Resolution {r} is outside {2 * BUCKET_STEP}-{4096} or not a multiple of {BUCKET_STEP}.")
+    return resolutions
+
+
+def make_buckets(resolutions, enabled):
     if not enabled:
-        return [(resolution, resolution)]
-    area = resolution * resolution
-    lo, hi = max(BUCKET_STEP, resolution // 2 // BUCKET_STEP * BUCKET_STEP), resolution * 2
-    buckets = set()
-    for w in range(lo, hi + 1, BUCKET_STEP):
-        h = area // w // BUCKET_STEP * BUCKET_STEP
-        if lo <= h <= hi:
-            buckets.add((w, h))
-            buckets.add((h, w))
-    return sorted(buckets)
+        return {r: [(r, r)] for r in resolutions}
+    buckets = {}
+    for resolution in resolutions:
+        area = resolution * resolution
+        lo, hi = max(BUCKET_STEP, resolution // 2 // BUCKET_STEP * BUCKET_STEP), resolution * 2
+        per_res = set()
+        for w in range(lo, hi + 1, BUCKET_STEP):
+            h = area // w // BUCKET_STEP * BUCKET_STEP
+            if lo <= h <= hi:
+                per_res.add((w, h))
+                per_res.add((h, w))
+        buckets[resolution] = sorted(per_res)
+    return buckets
 
 
 def closest_bucket(width, height, buckets):
@@ -145,8 +159,14 @@ def cached_cond(clip, caption, cache_root, folder):
 
 
 def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, text_batch, encode_captions=True):
-    """Scan the folders, assign buckets and fill the latent / text caches. encode_captions off leaves the .txt captions unencoded."""
-    buckets = make_buckets(resolution, bucketing)
+    """Scan the folders, assign buckets and fill the latent / text caches. encode_captions off leaves the .txt captions unencoded.
+
+    With several resolutions each image is assigned to one of them by a hash of its path, so the assignment is stable
+    across runs and the latent caches stay coherent."""
+    resolutions = parse_resolutions(resolution)
+    per_res_buckets = make_buckets(resolutions, bucketing)
+    if len(resolutions) > 1:
+        logging.info(f"[MOSS Trainer] Multi resolution training at {', '.join(str(r) for r in resolutions)}")
     items = []
     for folder, repeats in folders:
         found, missing = scan_folder(folder)
@@ -158,7 +178,8 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
             st = os.stat(item["image"])
             with Image.open(item["image"]) as img:
                 w, h = ImageOps.exif_transpose(img).size
-            item["bucket"] = closest_bucket(w, h, buckets)
+            resolved = resolutions[int.from_bytes(hashlib.sha1(item["image"].encode("utf-8")).digest(), "big") % len(resolutions)]
+            item["bucket"] = closest_bucket(w, h, per_res_buckets[resolved])
             item["repeats"] = repeats
             item["cache"] = cache
             item["latent_path"] = os.path.join(cache, "latents", _key(item["image"], st.st_mtime_ns, st.st_size, *item["bucket"]) + ".safetensors")

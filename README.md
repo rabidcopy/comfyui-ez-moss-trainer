@@ -119,7 +119,7 @@ These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:
 | target_layers | attn-mlp | q, k, v (or fused qkv), o, ffn_up_gate, ffn_down in all 42 blocks |
 | rank / alpha | 16 / 1.0 | |
 | learning_rate | 3e-4 | AdamW, weight decay 0.01, grad clip 1.0 |
-| resolution | 512 | Aspect buckets of equal area in 64px steps |
+| resolution | 512 | Aspect buckets of equal area in 64px steps; `512,768,1024` trains all listed resolutions, each image is hashed to one |
 | timesteps | logit-normal, shift 1.0 | x_t = (1-σ)·x0 + σ·ε, MSE on the velocity ε − x0 |
 | warmup | 50 steps | |
 

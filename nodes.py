@@ -40,7 +40,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Float.Input("learning_rate", default=3e-4, min=1e-7, max=1.0, step=1e-6, round=False),
                 io.Int.Input("batch_size", default=1, min=1, max=64, tooltip="Images per step, drawn from one resolution bucket."),
                 io.Int.Input("grad_accumulation", default=1, min=1, max=256, tooltip="Batches accumulated per optimizer step. Raises the effective batch without more VRAM."),
-                io.Int.Input("resolution", default=512, min=256, max=2048, step=64, tooltip="Training area is resolution x resolution pixels. 512 is comfortable on 8 GB, 768+ needs more VRAM or a larger reserve offload."),
+                io.String.Input("resolution", default="512", tooltip="Training area is resolution x resolution pixels. A comma separated list like 512,768,1024 trains all of them: each image is assigned to one of the resolutions. "
+                                "512 is comfortable on 8 GB, 768+ needs more VRAM or a larger reserve offload, and buckets far above 512 make steps several times more expensive."),
                 io.Boolean.Input("bucketing", default=True, tooltip="Aspect ratio buckets with the same pixel area. Off center-crops everything to a square."),
                 io.Combo.Input("optimizer", options=["AdamW", "Prodigy", "Adafactor", "SGD"], default="AdamW",
                                tooltip="Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0 and the constant scheduler. "
