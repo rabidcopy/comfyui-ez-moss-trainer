@@ -9,7 +9,7 @@ import folder_paths
 from comfy.weight_adapter import adapter_maps
 from comfy_api.latest import io
 
-from .dataset import build_dataset, cached_cond, parse_dataset_paths
+from .dataset import build_dataset, cached_cond, parse_dataset_paths, parse_resolutions
 from .pairs import ReferencePairs
 from .trainer import TARGET_PRESETS, train
 
@@ -104,6 +104,10 @@ class EZMOSSTrainLoRA(io.ComfyNode):
             save_path = save_path[:-len(".safetensors")]
 
         folders = parse_dataset_paths(dataset_paths)
+        # one canonical form, so a resume compares equal whatever the widget sent: "512" matches a saved int, and
+        # multi-resolution lists are always ordered the same way
+        resolution = parse_resolutions(resolution)
+        resolution = resolution[0] if len(resolution) == 1 else ",".join(map(str, resolution))
         cache_dir = os.path.abspath(cache_dir.strip()) if cache_dir.strip() else ""
         with torch.inference_mode(False):
             items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, text_batch, encode_captions=not reference_training)

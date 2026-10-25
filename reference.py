@@ -10,6 +10,8 @@ import comfy.model_prefetch
 import comfy.ops
 import comfy.patcher_extension
 import comfy.sd
+
+from .dataset import parse_resolutions
 import comfy.utils
 import folder_paths
 from comfy.ldm.flux.layers import timestep_embedding
@@ -240,9 +242,9 @@ class EZMOSSReference(io.ComfyNode):
 
 def trained_resolution(metadata):
     """The resolution the adapter was trained at. The references are scaled to the same area, so they have the token
-    count they had during training."""
+    count they had during training. Multi-resolution adapters trained at a mix, the largest keeps the most detail."""
     config = metadata.get("ez_moss_config")
-    return json.loads(config).get("resolution", 512) if config else 512
+    return max(parse_resolutions(json.loads(config).get("resolution", 512))) if config else 512
 
 
 class EZMOSSApplyReferences(io.ComfyNode):
