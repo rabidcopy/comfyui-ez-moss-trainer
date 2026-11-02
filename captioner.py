@@ -48,6 +48,8 @@ PRESETS = {
 }
 FIELDS_PRESET = "reference fields (JSON)"
 FIELDS = ("character", "outfit", "scene", "style", "visible")
+# .json sidecar keys read as an existing caption by caption_context
+CAPTION_KEYS = ("caption", "prompt", "description", "text")
 
 
 def parse_fields(text):
@@ -70,6 +72,27 @@ def source_tags(path):
             return [t.replace("_", " ") for t in json.load(f).get("tags", [])]
     except FileNotFoundError:
         return []
+
+
+def existing_caption(path, prepend):
+    """The image's current caption from its .txt, a .caption file or a caption field in the .json sidecar, in that order,
+    without the prepend this node added. Empty when there is none."""
+    base = os.path.splitext(path)[0]
+    text = ""
+    for ext in (".txt", ".caption"):
+        if os.path.isfile(base + ext):
+            with open(base + ext, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            break
+    else:
+        if os.path.isfile(base + ".json"):
+            with open(base + ".json", "r", encoding="utf-8") as f:
+                sidecar = json.load(f)
+            text = next((sidecar[k].strip() for k in CAPTION_KEYS if isinstance(sidecar.get(k), str)), "")
+    if prepend and text.startswith(prepend):
+        text = text[len(prepend):].lstrip(",.;: ")
+    return text
+
 
 class EZCaptionDataset(io.ComfyNode):
     @classmethod
@@ -98,13 +121,16 @@ class EZCaptionDataset(io.ComfyNode):
                 io.Int.Input("timeout", default=180, min=5, max=3600, tooltip="Seconds per request."),
                 io.String.Input("extra_instructions", multiline=True, default="",
                                 tooltip="Appended to the active system prompt (the preset, or system_prompt when set), e.g. \"Call the woman with silver hair 'kiri'.\""),
+                io.Boolean.Input("caption_context", default=False,
+                                 tooltip="Send the image's existing caption to the model as context, with any preset or system_prompt, e.g. to rewrite tags as a paragraph. "
+                                         "Read from its .txt (needs overwrite), a .caption file, or a caption/prompt/description/text field in its .json sidecar."),
             ],
             outputs=[io.String.Output(display_name="folder", tooltip="The captioned folder, connect it to the trainer's dataset_paths so training runs after captioning.")],
         )
 
     @classmethod
     async def execute(cls, folder, base_url, model, api_key, preset, prepend, system_prompt, overwrite, max_image_size, max_tokens, temperature,
-                      concurrency, timeout, extra_instructions) -> io.NodeOutput:
+                      concurrency, timeout, extra_instructions, caption_context) -> io.NodeOutput:
         warn_inline_key(api_key, "[EZ Captioner]")
         folder = os.path.abspath(os.path.expanduser(folder.strip().strip('"')))
         if not os.path.isdir(folder):
@@ -145,6 +171,8 @@ class EZCaptionDataset(io.ComfyNode):
                     image = await asyncio.to_thread(lambda: encode_image(ImageOps.exif_transpose(Image.open(path)), max_image_size))
                     tags = source_tags(path)
                     request = "Caption this image." + (f" Tags from its source, which can be incomplete or wrong: {', '.join(tags)}" if tags else "")
+                    if caption_context and (existing := existing_caption(path, prepend)):
+                        request += f"\n\nIts existing caption, which can be incomplete or wrong. Use it as context, but follow your instructions for the format:\n{existing}"
                     payload = {
                         "model": model,
                         "messages": [
