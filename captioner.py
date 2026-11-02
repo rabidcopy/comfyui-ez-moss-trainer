@@ -94,6 +94,16 @@ def existing_caption(path, prepend):
     return text
 
 
+def find_images(folder):
+    images = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in sorted(files):
+            if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                images.append(os.path.join(root, name))
+    return images
+
+
 class EZCaptionDataset(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -129,6 +139,14 @@ class EZCaptionDataset(io.ComfyNode):
         )
 
     @classmethod
+    def fingerprint_inputs(cls, folder, **kwargs):
+        # while images lack a caption, failed ones included, every queue runs again instead of reusing the cached result
+        folder = os.path.abspath(os.path.expanduser(folder.strip().strip('"')))
+        if os.path.isdir(folder) and any(not os.path.isfile(os.path.splitext(p)[0] + ".txt") for p in find_images(folder)):
+            return float("nan")
+        return ""
+
+    @classmethod
     async def execute(cls, folder, base_url, model, api_key, preset, prepend, system_prompt, overwrite, max_image_size, max_tokens, temperature,
                       concurrency, timeout, extra_instructions, caption_context) -> io.NodeOutput:
         warn_inline_key(api_key, "[EZ Captioner]")
@@ -137,12 +155,7 @@ class EZCaptionDataset(io.ComfyNode):
             raise FileNotFoundError(f"Folder not found: {folder}")
         if preset not in PRESETS:
             raise ValueError(f"Unknown preset {preset}")
-        images = []
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in sorted(files):
-                if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
-                    images.append(os.path.join(root, name))
+        images = find_images(folder)
         todo = [p for p in images if overwrite or not os.path.isfile(os.path.splitext(p)[0] + ".txt")]
         logging.info(f"[EZ Captioner] {len(images)} images, {len(todo)} to caption, {len(images) - len(todo)} already captioned")
         if not todo:
