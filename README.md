@@ -89,6 +89,18 @@ The training loss swings a lot from step to step because every step uses a rando
 
 A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`.
 
+### Previews
+
+The trainer samples one image with the LoRA in training before the run, every `preview_every` steps (default 250, 0 disables) and at the end. It shows on the node and is saved as `<output_name>_<step>_preview.png` next to the LoRA. The seed stays fixed, so the previews of a run are comparable.
+
+An empty `preview_prompt` uses the first training caption. `preview_prompt` and `preview_negative` are encoded when the run starts, because the text encoder is not loaded during training. Size, steps, cfg, sampler and scheduler work like a KSampler.
+
+`preview_lora` adds a LoRA to the previews only, such as an 8-step distilled LoRA with `preview_steps` 8 and `preview_cfg` 1. It does not affect training or the saved LoRA, so these previews show your LoRA combined with it.
+
+The **sample now** button samples after the current step with the node's current size, steps, cfg, sampler, scheduler and preview LoRA, which then stay for the rest of the run. Prompts can't change during a run.
+
+Previews use the same attention as training, so they differ slightly from a normal workflow at the same seed.
+
 ## Defaults
 
 These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:

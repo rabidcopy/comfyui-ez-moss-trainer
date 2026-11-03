@@ -1,16 +1,50 @@
+import base64
 import logging
 import os
+from io import BytesIO
 
+import numpy as np
 import torch
+from aiohttp import web
+from PIL import Image
 
 import comfy.model_base
 import comfy.model_management
+import comfy.samplers
 import folder_paths
 from comfy.weight_adapter import adapter_maps
 from comfy_api.latest import io
+from server import PromptServer
 
 from .dataset import build_dataset, cached_cond, parse_dataset_paths, parse_resolutions
-from .trainer import TARGET_PRESETS, train
+from .trainer import TARGET_PRESETS, sample_requests, train
+
+# the last training preview, sent to every open tab and to tabs opened later
+latest_preview = {}
+
+
+def show_preview(image, step, path):
+    buffer = BytesIO()
+    Image.fromarray((image.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)).save(buffer, "PNG")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(buffer.getvalue())
+    latest_preview.update(step=step, image="data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode())
+    PromptServer.instance.send_sync("ez_moss.preview", latest_preview)
+
+
+@PromptServer.instance.routes.post("/ez_moss/sample")
+async def sample_route(request):
+    settings = await request.json()
+    if settings["lora"] != "None" and folder_paths.get_full_path("loras", settings["lora"]) is None:
+        return web.json_response({"error": f"LoRA not found: {settings['lora']}"}, status=400)
+    sample_requests.append({k: settings[k] for k in ("width", "height", "steps", "cfg", "sampler", "scheduler", "lora", "lora_strength")})
+    return web.json_response({})
+
+
+@PromptServer.instance.routes.get("/ez_moss/preview")
+async def preview_route(request):
+    return web.json_response(latest_preview)
 
 
 class EZMOSSTrainLoRA(io.ComfyNode):
@@ -71,6 +105,20 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Boolean.Input("resume", default=False,
                                  tooltip="Continue the run saved under output_name from its last save, interruption or end, using <output_name>.training_state. "
                                          "Needs the same settings, steps can be raised to train longer and the seed of the saved run is used."),
+                io.Int.Input("preview_every", default=250, min=0, max=1000000,
+                             tooltip="Sample an image before training, every N steps and at the end, shown on the node and saved as <output_name>_<step>_preview.png next to the LoRA. "
+                                     "0 only samples on the 'sample now' button."),
+                io.String.Input("preview_prompt", multiline=True, default="", tooltip="Prompt of the previews, empty uses the first training caption. Encoded when the run starts."),
+                io.String.Input("preview_negative", multiline=True, default="", tooltip="Negative prompt of the previews, only used with a cfg other than 1. Encoded when the run starts."),
+                io.Int.Input("preview_width", default=512, min=64, max=4096, step=16),
+                io.Int.Input("preview_height", default=512, min=64, max=4096, step=16),
+                io.Int.Input("preview_steps", default=20, min=1, max=1000, tooltip="An 8-step distilled LoRA needs 8 here and cfg 1."),
+                io.Float.Input("preview_cfg", default=4.0, min=0.0, max=100.0, step=0.1, round=0.01, tooltip="1 skips the negative prompt and takes half the time per step."),
+                io.Combo.Input("preview_sampler", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
+                io.Combo.Input("preview_scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
+                io.Combo.Input("preview_lora", options=["None"] + folder_paths.get_filename_list("loras"), default="None",
+                               tooltip="LoRA applied on top of the one in training, for the previews only, e.g. a distilled LoRA for fast sampling. It does not affect training or the saved LoRA."),
+                io.Float.Input("preview_lora_strength", default=1.0, min=-100.0, max=100.0, step=0.01),
             ],
             outputs=[
                 io.Custom("LORA_MODEL").Output(display_name="lora", tooltip="Trained weights, connect to Load LoRA Model to try them."),
@@ -84,7 +132,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
                 resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
                 gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile,
-                text_batch, resume) -> io.NodeOutput:
+                text_batch, resume, preview_every, preview_prompt, preview_negative, preview_width, preview_height, preview_steps, preview_cfg, preview_sampler,
+                preview_scheduler, preview_lora, preview_lora_strength) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
             raise ValueError(f"EZ MOSS Trainer needs a MOSS-Image model, got {type(model.model).__name__}.")
         if algorithm not in adapter_maps or target_layers not in TARGET_PRESETS or save_dtype not in ("bf16", "fp32"):
@@ -106,6 +155,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
         with torch.inference_mode(False):
             items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, text_batch)
             empty_cond = cached_cond(clip, "", cache_dir, folders[0][0]) if caption_dropout > 0 else None
+            positive = cached_cond(clip, preview_prompt.strip(), cache_dir, folders[0][0]) if preview_prompt.strip() else items[0]["cond"]
+            negative = cached_cond(clip, preview_negative.strip(), cache_dir, folders[0][0])
             # free the text encoder and VAE, the transformer needs the VRAM and pinned RAM while training
             comfy.model_management.unload_model_and_clones(clip.patcher)
             comfy.model_management.unload_model_and_clones(vae.patcher)
@@ -115,8 +166,10 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                    "max_grad_norm": max_grad_norm, "caption_dropout": caption_dropout, "timestep_distribution": timestep_distribution,
                    "timestep_shift": timestep_shift, "gradient_checkpointing": gradient_checkpointing, "vram_reserve_gb": vram_reserve_gb,
                    "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every, "compile": compile}
+            preview = {"every": preview_every, "width": preview_width, "height": preview_height, "steps": preview_steps, "cfg": preview_cfg, "sampler": preview_sampler, "scheduler": preview_scheduler,
+                       "lora": preview_lora, "lora_strength": preview_lora_strength, "positive": positive, "negative": negative, "vae": vae, "show": show_preview}
             logging.info(f"[MOSS Trainer] Saving to {save_path}*.safetensors")
             with torch.enable_grad():
-                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, resume)
+                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, preview, resume)
         return io.NodeOutput(lora, loss_map, steps)
 

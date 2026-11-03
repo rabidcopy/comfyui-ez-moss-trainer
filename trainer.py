@@ -10,12 +10,16 @@ import safetensors.torch
 import torch
 from prodigyplus import ProdigyPlusScheduleFree
 
+import comfy.lora
+import comfy.lora_convert
 import comfy.model_management
+import comfy.sample
 from comfy.cli_args import args
 import comfy.utils
+import folder_paths
 import node_helpers
 from comfy.ldm.modules.attention import attention_pytorch
-from comfy.weight_adapter import adapter_maps
+from comfy.weight_adapter import WeightAdapterBase, adapter_maps
 from comfy.weight_adapter.bypass import BypassInjectionManager
 from comfy.weight_adapter.loha import HadaWeight, LohaDiff
 from comfy.weight_adapter.oft import OFTDiff
@@ -31,6 +35,9 @@ TARGET_PRESETS = {
 
 # settings a resumed run may change, the rest must match the saved run
 RESUME_FREE = {"steps", "seed", "save_every", "log_every", "validation_every", "vram_reserve_gb", "compile", "gradient_checkpointing"}
+
+# preview settings from the node's sample button, picked up between training steps
+sample_requests = []
 
 
 class LohaBypass(LohaDiff):
@@ -128,6 +135,64 @@ def save_lora(sd, path, metadata):
     logging.info(f"[MOSS Trainer] Saved {path}")
 
 
+class FusedAdapter:
+    """Adapters on slices of one fused linear, a bypass hook takes a single adapter per module."""
+
+    def __init__(self, slices):
+        self.slices = slices
+
+    def h(self, x, base_out):
+        out = torch.zeros_like(base_out)
+        for start, size, adapter in self.slices:
+            out[..., start:start + size] = adapter.h(x, None)
+        return out
+
+    def g(self, y):
+        return y
+
+
+def lora_injections(mp, name, strength):
+    """Bypass injections of a LoRA file. Core's bypass loader drops adapters on a slice of a weight, which is what the q, k and v
+    keys of a LoRA become on fused qkv files."""
+    lora = comfy.lora_convert.convert_lora(comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", name), safe_load=True))
+    # moved here because the hooks can't reach the adapters inside a FusedAdapter
+    lora = {k: v.to(mp.load_device, mp.model.get_dtype_inference()) if v.ndim > 1 else v for k, v in lora.items()}
+    manager = BypassInjectionManager()
+    fused = {}
+    for key, adapter in comfy.lora.load_lora(lora, comfy.lora.model_lora_keys_unet(mp.model, {})).items():
+        if not isinstance(adapter, WeightAdapterBase):
+            logging.warning(f"[MOSS Trainer] {name}: {key} is not an adapter, previews skip it")
+        elif isinstance(key, tuple):
+            adapter.multiplier = strength
+            fused.setdefault(key[0], []).append((key[1][1], key[1][2], adapter))
+        else:
+            manager.add_adapter(key, adapter, strength)
+    for key, slices in fused.items():
+        manager.add_adapter(key, FusedAdapter(slices), strength)
+    return manager.create_injections(mp.model)
+
+
+def sample_image(mp, preview, seed):
+    """One image from the adapters in training through the native samplers, as a [H, W, 3] tensor."""
+    device, dtype = mp.load_device, mp.model.get_dtype_inference()
+    latent_format = mp.model.latent_format
+    latent = torch.zeros([1, latent_format.latent_channels, preview["height"] // latent_format.spacial_downscale_ratio, preview["width"] // latent_format.spacial_downscale_ratio],
+                         device=comfy.model_management.intermediate_device())
+    injections = lora_injections(mp, preview["lora"], preview["lora_strength"]) if preview["lora"] != "None" else []
+    for injection in injections:
+        injection.inject(mp)
+    try:
+        # eager, the blocks would recompile for the grad mode and the hooks of a preview
+        with torch.no_grad(), torch.compiler.set_stance("force_eager"), torch.autocast(device.type, dtype=dtype, enabled=dtype in (torch.bfloat16, torch.float16)):
+            samples = comfy.sample.sample(mp, comfy.sample.prepare_noise(latent, seed), preview["steps"], preview["cfg"], preview["sampler"], preview["scheduler"],
+                                          [[preview["positive"][None], {}]], [[preview["negative"][None], {}]], latent, disable_pbar=True, seed=seed)
+    finally:
+        for injection in injections:
+            injection.eject(mp)
+    with torch.no_grad():
+        return preview["vae"].decode(samples)[0]
+
+
 def make_optimizer(name, params, lr, weight_decay, device):
     if name == "AdamW":
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
@@ -204,8 +269,9 @@ def _fmt_time(seconds):
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
-def train(mp, items, empty_cond, cfg, save_path, resume=False):
+def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
     """Trains bypass adapters on the MOSS transformer. Returns (lora state dict, loss map).
+    preview holds the sampling settings, conditioning, VAE and show callback of the previews.
     resume continues from the training state saved next to the LoRA files at their last save."""
     device = mp.load_device
     dtype = mp.model.get_dtype_inference()
@@ -265,10 +331,10 @@ def train(mp, items, empty_cond, cfg, save_path, resume=False):
         rng.setstate(state["rng"])
         generator.set_state(state["generator"])
     model_sampling = mp.model.model_sampling
-    transformer_options = mp.model_options.get("transformer_options", {}).copy()
+    # quantized checkpoints can pin int8 kitchen attention per block, which has no backward and takes no autocast dtypes in previews
+    mp.model_options.setdefault("transformer_options", {})["optimized_attention_override"] = lambda func, *args, **kwargs: attention_pytorch(*args, **kwargs)
+    transformer_options = mp.model_options["transformer_options"].copy()
     transformer_options["prefetch_dynamic_vbars"] = mp.is_dynamic()
-    # quantized checkpoints can pin int8 kitchen attention per block, which has no backward
-    transformer_options["optimized_attention_override"] = lambda func, *args, **kwargs: attention_pytorch(*args, **kwargs)
 
     def predict(xt, sigma, context):
         timestep = model_sampling.timestep(sigma).float()
@@ -295,6 +361,19 @@ def train(mp, items, empty_cond, cfg, save_path, resume=False):
             validation.append(sum(entry_loss(predict, entry) for entry in val_set) / len(val_set))
         validation_steps.append(step)
         # hand the cached activation memory back to dynamic VRAM's weight cache
+        torch.cuda.empty_cache()
+
+    def show_preview(step):
+        begin = time.perf_counter()
+        try:
+            preview["show"](sample_image(mp, preview, cfg["seed"]), step, f"{save_path}_{step:06d}_preview.png")
+            logging.info(f"[MOSS Trainer] preview at step {step} in {time.perf_counter() - begin:.1f} s, {preview['width']}x{preview['height']}, {preview['steps']} steps, cfg {preview['cfg']}, "
+                         f"{preview['sampler']}/{preview['scheduler']}" + (f", {preview['lora']}" if preview["lora"] != "None" else ""))
+        except torch.OutOfMemoryError:
+            logging.warning(f"[MOSS Trainer] Out of VRAM on the preview at step {step}, training continues. Lower the preview resolution")
+        # the decode loaded the VAE next to the transformer, training needs that VRAM back
+        comfy.model_management.unload_model_and_clones(preview["vae"].patcher)
+        comfy.model_management.load_models_gpu([mp], memory_required=int(cfg["vram_reserve_gb"] * 1024 ** 3))
         torch.cuda.empty_cache()
 
     steps = cfg["steps"]
@@ -352,6 +431,9 @@ def train(mp, items, empty_cond, cfg, save_path, resume=False):
                 validate(start_step)
                 logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training ({len(val_images)} images x {len(VALIDATION_SIGMAS)} noise levels)")
             val_start = validation[0]
+        sample_requests.clear()
+        if preview["every"] > 0 and start_step == 0:
+            show_preview(0)
         # saved states hold the schedule-free evaluation weights, training steps from the training weights
         if schedule_free:
             optimizer.train()
@@ -424,7 +506,13 @@ def train(mp, items, empty_cond, cfg, save_path, resume=False):
                              f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB | device free {free:.2f} GB")
             evaluate = cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps)
             save = cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps
-            if schedule_free and (evaluate or save):
+            show = preview["every"] > 0 and ((step + 1) % preview["every"] == 0 or step + 1 == steps)
+            if sample_requests:
+                # the latest settings win and stay for the rest of the run
+                preview.update(sample_requests[-1])
+                sample_requests.clear()
+                show = True
+            if schedule_free and (evaluate or save or show):
                 optimizer.eval()
             if evaluate:
                 validate(step + 1)
@@ -432,7 +520,9 @@ def train(mp, items, empty_cond, cfg, save_path, resume=False):
             if save:
                 save_lora(state_dict(), f"{save_path}_{step + 1:06d}.safetensors", {**metadata, "ss_steps": step + 1})
                 save_state(step + 1)
-            if schedule_free and (evaluate or save):
+            if show:
+                show_preview(step + 1)
+            if schedule_free and (evaluate or save or show):
                 optimizer.train()
         if schedule_free:
             optimizer.eval()
