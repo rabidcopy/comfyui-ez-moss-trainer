@@ -131,6 +131,9 @@ def save_lora(sd, path, metadata):
 def make_optimizer(name, params, lr, weight_decay, device):
     if name == "AdamW":
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
+    if name == "Muon":
+        # orthogonalises each matrix's update; match_rms_adamw scales the step to AdamW's update size, so learning rates carry over
+        return torch.optim.Muon(params, lr=lr, weight_decay=weight_decay, adjust_lr_fn="match_rms_adamw")
     if name == "Prodigy":
         # the library default d0=1e-6 never takes off here: with one random sigma and noise per batch the
         # per-step gradient aligns with the accumulated weights too little for d to grow, so the run trains

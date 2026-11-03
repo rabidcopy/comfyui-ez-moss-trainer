@@ -42,8 +42,9 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.String.Input("resolution", default="512", tooltip="Training area is resolution x resolution pixels. A comma separated list like 512,768,1024 trains all of them: each image is assigned to one of the resolutions. "
                                 "512 is comfortable on 8 GB, 768+ needs more VRAM or a larger reserve offload, and buckets far above 512 make steps several times more expensive."),
                 io.Boolean.Input("bucketing", default=True, tooltip="Aspect ratio buckets with the same pixel area. Off center-crops everything to a square."),
-                io.Combo.Input("optimizer", options=["AdamW", "Prodigy", "Adafactor", "SGD"], default="AdamW",
-                               tooltip="Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0 and the constant scheduler. "
+                io.Combo.Input("optimizer", options=["AdamW", "Muon", "Prodigy", "Adafactor", "SGD"], default="AdamW",
+                               tooltip="Muon orthogonalises each update of the LoRA matrices, its step is scaled to AdamW's so the same learning rates apply. It trains LoRA, LoHa and LoKr, not OFT. "
+                                       "Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0 and the constant scheduler. "
                                        "Its initial step estimate is raised to 1e-4, the library default 1e-6 stalls and barely learns."),
                 io.Combo.Input("lr_scheduler", options=["constant", "cosine", "linear"], default="constant"),
                 io.Int.Input("warmup_steps", default=50, min=0, max=100000),
