@@ -31,38 +31,9 @@ PRESETS = {
                                     "refer to them only as \"the character\".",
     "text-heavy (OCR)": "You write captions for text-to-image training data. First describe the image in two or three sentences of plain natural language, "
                         "then describe every piece of visible text: quote it exactly, and say where it is, its font style, size and color.",
-    "reference fields (JSON)": "You write structured captions for training a model that takes a character or an art style from reference images. "
-                               "Reply with only a JSON object with these string keys, each in plain natural language:\n"
-                               "\"character\": the main character's permanent look: species, body type, fur, skin, scale or feather colors and markings, "
-                               "hair style and color, eye color, face, and permanent features such as horns, wings, tails, scars or tattoos. No clothing.\n"
-                               "\"outfit\": everything the main character wears or carries: clothing, accessories, jewelry, held objects. \"none\" if nothing.\n"
-                               "\"scene\": pose, action, expression, camera angle and framing, any other characters and objects, the setting and background, "
-                               "lighting, and visible text quoted exactly. A signature, watermark, handle or URL is mentioned only as \"a signature\" or "
-                               "\"a watermark\" and where it is, never its text, and text naming a character is left out. "
-                               "Call the main character \"the character\" and do not repeat the character or outfit fields.\n"
-                               "\"style\": the art style alone: medium, line work, shading and rendering, color palette, texture and level of detail. No subject matter.\n"
-                               "\"visible\": \"yes\" if one character is the clear main subject with their face and most of their body shown, "
-                               "\"partial\" if they are small, cropped or partly hidden, \"no\" if there is no single main character.\n"
-                               "With no single main character, leave character and outfit empty and describe everyone in scene. "
-                               "Never name characters, artists or franchises. State only what is visible.",
 }
-FIELDS_PRESET = "reference fields (JSON)"
-FIELDS = ("character", "outfit", "scene", "style", "visible")
 # .json sidecar keys read as an existing caption by caption_context
 CAPTION_KEYS = ("caption", "prompt", "description", "text")
-
-
-def parse_fields(text):
-    """The reference fields reply as one line of JSON, None when it is not a JSON object with every field."""
-    try:
-        fields = json.loads(text[text.find("{"):text.rfind("}") + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(fields, dict) or not all(isinstance(fields.get(k), str) for k in FIELDS):
-        return None
-    fields = {k: fields[k].strip() for k in FIELDS}
-    fields["visible"] = fields["visible"].lower()
-    return json.dumps(fields, ensure_ascii=False)
 
 
 def source_tags(path):
@@ -165,9 +136,6 @@ class EZCaptionDataset(io.ComfyNode):
         if extra_instructions.strip():
             system += "\n\n" + extra_instructions.strip()
         prepend = prepend.strip()
-        if prepend and preset == FIELDS_PRESET:
-            logging.warning(f"[EZ Captioner] prepend is ignored by the '{FIELDS_PRESET}' preset, it would break the JSON")
-            prepend = ""
         done = 0
         failed = []
         semaphore = asyncio.Semaphore(concurrency)
@@ -198,9 +166,6 @@ class EZCaptionDataset(io.ComfyNode):
                     name = os.path.relpath(path, folder)
                     try:
                         text = await chat(session, base_url, api_key, payload, name, "[EZ Captioner]")
-                        if preset == FIELDS_PRESET and (text := parse_fields(text)) is None:
-                            # refusals land here too, so they are retried on the next run instead of saved
-                            raise RuntimeError(f"reply is not a JSON object with {', '.join(FIELDS)}")
                     except RuntimeError as e:
                         failed.append(path)
                         pbar.update(1)

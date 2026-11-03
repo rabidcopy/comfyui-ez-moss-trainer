@@ -10,7 +10,6 @@ from comfy.weight_adapter import adapter_maps
 from comfy_api.latest import io
 
 from .dataset import build_dataset, cached_cond, parse_dataset_paths, parse_resolutions
-from .pairs import ReferencePairs
 from .trainer import TARGET_PRESETS, train
 
 
@@ -65,12 +64,6 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                              tooltip="Log a validation loss on up to 4 dataset images at fixed noise levels and noise every N steps, a much steadier progress signal than the training loss. 0 disables."),
                 io.Boolean.Input("compile", default=True,
                                  tooltip="torch.compile the transformer blocks: about 25% faster and about 1 GB less VRAM, the first step takes about a minute longer. Needs triton (triton-windows on Windows), skipped with a warning when it is missing."),
-                io.Boolean.Input("reference_training", default=False,
-                                 tooltip="Train a reference adapter for EZ MOSS Apply References instead of a plain LoRA. Needs a .json sidecar next to each image (see the README) and captions "
-                                         "from the 'reference fields (JSON)' preset: every step pairs an image with character or style references and leaves what they supply out of the caption half the time."),
-                io.String.Input("reference_plans", default="",
-                                tooltip="Comma separated list of the reference plans to train: character, style, character+style, character + style, character + character, style + style. "
-                                       "Empty trains all of them. Useful to find out which pairing a model can learn."),
                 io.Int.Input("text_batch", default=8, min=1, max=64,
                              tooltip="Captions encoded together while caching text. 8 is about 1.6x faster than 1 on an 8 GB card and gives the same result, "
                                      "larger batches are not faster. Lower it if caching runs out of memory, 1 encodes one caption at a time."),
@@ -89,7 +82,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
                 resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
-                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile, reference_training, reference_plans,
+                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile,
                 text_batch, resume) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
             raise ValueError(f"EZ MOSS Trainer needs a MOSS-Image model, got {type(model.model).__name__}.")
@@ -110,10 +103,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
         resolution = resolution[0] if len(resolution) == 1 else ",".join(map(str, resolution))
         cache_dir = os.path.abspath(cache_dir.strip()) if cache_dir.strip() else ""
         with torch.inference_mode(False):
-            items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, text_batch, encode_captions=not reference_training)
-            pairs = ReferencePairs(items, reference_plans) if reference_training else None
-            if pairs is not None:
-                pairs.cache_text(clip, text_batch)
+            items = build_dataset(clip, vae, model.model.latent_format, folders, resolution, bucketing, cache_dir, text_batch)
             empty_cond = cached_cond(clip, "", cache_dir, folders[0][0]) if caption_dropout > 0 else None
             # free the text encoder and VAE, the transformer needs the VRAM and pinned RAM while training
             comfy.model_management.unload_model_and_clones(clip.patcher)
@@ -123,10 +113,9 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                    "optimizer": optimizer, "lr_scheduler": lr_scheduler, "warmup_steps": warmup_steps, "weight_decay": weight_decay,
                    "max_grad_norm": max_grad_norm, "caption_dropout": caption_dropout, "timestep_distribution": timestep_distribution,
                    "timestep_shift": timestep_shift, "gradient_checkpointing": gradient_checkpointing, "vram_reserve_gb": vram_reserve_gb,
-                   "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every, "compile": compile,
-                   "reference_training": reference_training}
+                   "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every, "compile": compile}
             logging.info(f"[MOSS Trainer] Saving to {save_path}*.safetensors")
             with torch.enable_grad():
-                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, pairs, resume)
+                lora, loss_map = train(model.clone(), items, empty_cond, cfg, save_path, resume)
         return io.NodeOutput(lora, loss_map, steps)
 

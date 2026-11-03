@@ -17,8 +17,7 @@ Text tokens go through every transformer block along with the image tokens, so l
 Captions every image in a folder (subfolders included) with a vision LLM served behind an OpenAI-compatible API, and writes `image.txt` next to `image.png`. It defaults to LM Studio on `http://127.0.0.1:1234/v1`. Ollama (`:11434/v1`), llama.cpp (`:8080/v1`), vLLM and OpenAI work the same way. Requests only go to the `base_url` you set.
 
 - **list models** fetches `<base_url>/models` and opens a searchable picker at the button. Type to filter (several words all have to match, e.g. `qwen vl`), then click a model or press Enter. An empty `model` uses the first model the server lists. If the button still shows the old menu after updating, hard refresh the browser (Ctrl+F5).
-- Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`, `reference fields (JSON)`. `system_prompt` replaces the preset when set.
-- `reference fields (JSON)` writes one line of JSON with `character` (permanent look), `outfit`, `scene`, `style` and `visible` (`yes`, `partial` or `no`), so captions for reference training can leave out whatever a reference image supplies. A reply that is not such an object, a refusal for example, counts as failed and is retried on the next run. `prepend` is ignored.
+- Presets: `detailed` (default, suits MOSS's LLM text encoder), `medium`, `short`, `tags`, `style LoRA (content only)`, `character LoRA (no identity)`, `text-heavy (OCR)`. `system_prompt` replaces the preset when set.
 - If an image has a `.json` next to it with a `tags` list, the tags are sent with the image as hints. `extra_instructions` is appended to whichever of the two is active, e.g. `Call the woman with silver hair 'kiri'.`
 - `prepend` adds a trigger word, e.g. `mytrigger` → `mytrigger, A woman in...`.
 - `caption_context` sends an image's existing caption to the model as context with any preset or `system_prompt`, e.g. to turn tag captions into `detailed` paragraphs or to rewrite captions under your own instructions. It reads the image's `.txt` (re-captioned only with `overwrite` on), else a `.caption` file, else a `caption`, `prompt`, `description` or `text` field in its `.json` sidecar.
@@ -77,7 +76,7 @@ When everything is cached, the text encoder and VAE are not run, and the transfo
 
 ### Output
 
-`models/loras/<output_name>.safetensors`, plus `<output_name>_<step>.safetensors` every `save_every` steps. If you cancel the queue, the current weights are saved as `<output_name>_<step>_interrupted.safetensors`. Every save also overwrites `<output_name>.training_state` (fp32 weights, optimizer and sampler state); turn on `resume` with the same settings to continue from it, raising `steps` to train longer. Images and folders can be added or removed before resuming: only new images are encoded, and added images join from the next epoch. The validation images stay the same unless one was removed. With `reference_training`, their references can change when added images give them new candidates. LoRA files trained on fused-qkv MOSS files are saved with split `q/k/v` keys, so they load on both fused and unfused MOSS checkpoints.
+`models/loras/<output_name>.safetensors`, plus `<output_name>_<step>.safetensors` every `save_every` steps. If you cancel the queue, the current weights are saved as `<output_name>_<step>_interrupted.safetensors`. Every save also overwrites `<output_name>.training_state` (fp32 weights, optimizer and sampler state); turn on `resume` with the same settings to continue from it, raising `steps` to train longer. Images and folders can be added or removed before resuming: only new images are encoded, and added images join from the next epoch. The validation images stay the same unless one was removed. LoRA files trained on fused-qkv MOSS files are saved with split `q/k/v` keys, so they load on both fused and unfused MOSS checkpoints.
 
 ### Validation loss
 
@@ -88,28 +87,7 @@ The training loss swings a lot from step to step because every step uses a rando
 [MOSS Trainer] validation loss 0.1214 at step 300 (-6.7% since start)
 ```
 
-A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`. With `reference_training` on, each line also gives the loss change when the references are left out (`+0.0123 without references`) and the `wrong reference margin`, how much worse the wrong character's reference is than the correct one on the same target, caption and noise. The margin is the identity signal on its own: the gap above is dominated by the reference's style, a reference of another artist makes the prediction worse even when the identity is right. A margin that grows means the adapter tells the characters apart. A second line breaks the gap down by noise level and by reference type, and the margin by noise level. The validation images draw their references at random, so some reference types may not be among them. A second line therefore also measures one fixed entry per reference type (a validation image when one has that type) and `partner`, each validation image with another image of the same character as its reference. The partner reference is the easiest kind, so if its gap does not grow, the adapter is not reading references at all. These extra entries are left out of the validation loss and the first gap, and roughly double the validation time.
-
-## Reference adapter
-
-`reference_training` trains an adapter that takes a character's look, an art style or both from reference images at generation time, with no LoRA per character. It needs captions from the `reference fields (JSON)` preset and a `.json` sidecar next to each image with:
-
-- `artist`: the image's one artist.
-- `characters`: the named characters in it, which can be an empty list.
-- `sheet`: `true` for model and reference sheets.
-- `related`: the post ids of the image and of its other versions, including its own id.
-
-Character and artist names only need to be consistent within the dataset.
-
-- Every step pairs an image with one or two references. A character reference shows the same single character by another artist. A style reference is by the same artist with no shared character. A character+style reference shares both. The caption leaves out the fields the references supply half the time and keeps them the other half, so the caption alone does not tell the adapter whether it has to read a reference. It drops the outfit half the time when the character comes from a reference. One step in ten has no references. Versions of one post and near duplicates are never paired. Model sheets are only used as references.
-- Steps with references train on noise levels of 0.7 and above. Below that the image itself still carries the character's look, so the reference cannot be its source there and training on it teaches the adapter to leave references alone.
-- To teach the adapter to read references at all, some steps use another image of the same character as the reference, by the same artist when there is one: 30% of steps at the start of a run, tapering to 10% at the end. Validation never uses them. A crop of the image itself would be easier still, but the model can paste that into the output instead of reading it.
-- A quarter of the steps with a character reference also run the same target with another character's reference. The correct reference has to make the prediction better than the wrong one, so a model that ignores the reference is pushed to read it. It costs one extra forward and backward on those steps.
-- Each training image gets up to 8 caption variants. All of them are encoded once before training: about 7,800 for 1,666 images, roughly 12.5 GB in `.moss_cache/text`. They are read from disk per step instead of kept in RAM.
-- `reference_plans` trains a subset of the plans only, a comma separated list of `character`, `style`, `character+style`, `character + style`, `character + character` and `style + style`. Empty trains all of them. Training one plan at a time for a few hundred steps shows which pairing a model can learn at all.
-- References run through the transformer next to the image at timestep 0. Each one only attends to itself. The image and the prompt attend to all of them. While sampling, each reference's per-block keys and values are computed once and reused every step. That takes about 0.5 GB of VRAM per 512px reference for the length of the run. A reference that doesn't fit in free VRAM is cached in RAM instead and copied in block by block, which is slower but doesn't run out of memory. The file is a normal LoRA plus `ez_moss_reference.mode_embedding`, one learned vector per mode.
-
-To generate, add one **EZ MOSS Reference** per image (`mode`, `strength`, `fidelity`) and connect them all to **EZ MOSS Apply References** together with the model, the VAE and the adapter. `strength` scales the attention paid to that reference. `fidelity` is the fraction of the sampling steps that see it, so lower values keep the broad look and leave the details to the prompt. References are scaled to about `size` x `size` pixels, `size` 0 uses the resolution the adapter was trained at.
+A steady decline means the LoRA is learning the dataset. A large drop late in the run usually means memorization, so compare the intermediate saves. The values are also in `loss_map` under `validation` and `validation_steps`.
 
 ## Defaults
 

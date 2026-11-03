@@ -158,8 +158,8 @@ def cached_cond(clip, caption, cache_root, folder):
     return safetensors.torch.load_file(path)["cond"]
 
 
-def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, text_batch, encode_captions=True):
-    """Scan the folders, assign buckets and fill the latent / text caches. encode_captions off leaves the .txt captions unencoded.
+def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cache_root, text_batch):
+    """Scan the folders, assign buckets and fill the latent / text caches.
 
     With several resolutions each image is assigned to one of them by a hash of its path, so the assignment is stable
     across runs and the latent caches stay coherent."""
@@ -200,15 +200,14 @@ def build_dataset(clip, vae, latent_format, folders, resolution, bucketing, cach
             if (n + 1) % 25 == 0:
                 logging.info(f"[MOSS Trainer]   latents {n + 1}/{len(todo)}")
 
-    todo = {i["text_path"]: i["caption"] for i in items if encode_captions and not os.path.isfile(i["text_path"])}
+    todo = {i["text_path"]: i["caption"] for i in items if not os.path.isfile(i["text_path"])}
     if todo:
         logging.info(f"[MOSS Trainer] Caching {len(todo)} text encodings")
         cache_texts(clip, todo, text_batch)
 
     for item in items:
         item["latent"] = safetensors.torch.load_file(item["latent_path"])["latent"]
-        if encode_captions:
-            item["cond"] = safetensors.torch.load_file(item["text_path"])["cond"]
+        item["cond"] = safetensors.torch.load_file(item["text_path"])["cond"]
 
     counts = {}
     for item in items:
