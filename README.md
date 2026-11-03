@@ -80,7 +80,7 @@ When everything is cached, the text encoder and VAE are not run, and the transfo
 
 ### Validation loss
 
-The training loss swings a lot from step to step because every step uses a random noise level. Every `validation_every` steps (default 100, 0 disables), the trainer also measures the loss on up to 4 dataset images at fixed noise levels (0.25, 0.5, 0.75, 0.9) with fixed noise. It does the same once before training as a baseline. Example output:
+The training loss swings a lot from step to step because every step uses a random noise level. Every `validation_every` steps (default 250, 0 disables), the trainer also measures the loss on up to 4 dataset images at fixed noise levels (0.25, 0.5, 0.75, 0.9) with fixed noise. It does the same once before training as a baseline. Example output:
 
 ```
 [MOSS Trainer] validation loss 0.1301 before training (4 images x 4 noise levels)
@@ -103,16 +103,17 @@ Previews use the same attention as training, so they differ slightly from a norm
 
 ## Defaults
 
-These follow OneTrainer's MOSS LoRA preset (PR #1741) where it has one:
+Target layers, resolution and timesteps follow OneTrainer's MOSS LoRA preset (PR #1741). Rank, alpha and the optimizer settings are chosen for Muon:
 
 | Setting | Default | Note |
 |---|---|---|
 | target_layers | attn-mlp | q, k, v (or fused qkv), o, ffn_up_gate, ffn_down in all 42 blocks |
-| rank / alpha | 16 / 1.0 | |
-| learning_rate | 3e-4 | AdamW, weight decay 0.01, grad clip 1.0 |
+| rank / alpha | 8 / 8 | |
+| learning_rate | 2e-4 | Muon, cosine schedule, weight decay 0.01, grad clip 1.0 |
 | resolution | 512 | Aspect buckets of equal area in 64px steps; `512,768,1024` trains all listed resolutions, each image is hashed to one |
 | timesteps | logit-normal, shift 1.0 | x_t = (1-σ)·x0 + σ·ε, MSE on the velocity ε − x0 |
-| warmup | 50 steps | |
+| warmup | 100 steps | |
+| previews | 1024x1024, 8 steps, cfg 1 | euler. Uses the `radiance_shift` scheduler from ComfyUI-UtilsCollection when installed, otherwise simple, and `8-steps-dmd2-lora.safetensors` when it is in the loras folder. Without a distilled LoRA use about 20 steps and cfg 4 |
 
 ## Compile
 

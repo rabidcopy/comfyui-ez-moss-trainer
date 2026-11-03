@@ -19,6 +19,9 @@ from server import PromptServer
 from .dataset import build_dataset, cached_cond, parse_dataset_paths, parse_resolutions
 from .trainer import TARGET_PRESETS, sample_requests, train
 
+# selected by default when installed, the default 8 steps at cfg 1 need a distilled LoRA
+DISTILLED_LORA = "8-steps-dmd2-lora.safetensors"
+
 # the last training preview, sent to every open tab and to tabs opened later
 latest_preview = {}
 
@@ -50,6 +53,8 @@ async def preview_route(request):
 class EZMOSSTrainLoRA(io.ComfyNode):
     @classmethod
     def define_schema(cls):
+        loras = ["None"] + folder_paths.get_filename_list("loras")
+        schedulers = comfy.samplers.KSampler.SCHEDULERS
         return io.Schema(
             node_id="EZMOSSTrainLoRA",
             display_name="EZ MOSS-Image LoRA Trainer",
@@ -66,22 +71,22 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                                 tooltip="One folder per line. Each image needs a same-named .txt caption next to it. Add `| N` after a folder to repeat it N times per epoch, e.g. C:/data/style | 2"),
                 io.String.Input("output_name", default="moss_lora", tooltip="File name in the first loras folder. Intermediate saves get a _<step> suffix."),
                 io.Combo.Input("algorithm", options=list(adapter_maps), default="LoRA"),
-                io.Int.Input("rank", default=16, min=1, max=256, tooltip="LoRA/LoHa rank. For LoKr and OFT it is the factorization / block size hint."),
-                io.Float.Input("alpha", default=1.0, min=0.0, max=256.0, step=0.5, tooltip="Scale is alpha / rank. OneTrainer's default 1.0 pairs with learning rate 3e-4. For OFT this is the constraint."),
+                io.Int.Input("rank", default=8, min=1, max=256, tooltip="LoRA/LoHa rank. For LoKr and OFT it is the factorization / block size hint."),
+                io.Float.Input("alpha", default=8.0, min=0.0, max=256.0, step=0.5, tooltip="Scale is alpha / rank, so raising it strengthens every step much like the learning rate does. For OFT this is the constraint."),
                 io.Combo.Input("target_layers", options=list(TARGET_PRESETS), default="attn-mlp", tooltip="Transformer block linears to train. attn-mlp matches OneTrainer's MOSS LoRA preset."),
                 io.Int.Input("steps", default=1500, min=1, max=1000000, tooltip="Optimizer steps."),
-                io.Float.Input("learning_rate", default=3e-4, min=1e-7, max=1.0, step=1e-6, round=False),
+                io.Float.Input("learning_rate", default=2e-4, min=1e-7, max=1.0, step=1e-6, round=False),
                 io.Int.Input("batch_size", default=1, min=1, max=64, tooltip="Images per step, drawn from one resolution bucket."),
                 io.Int.Input("grad_accumulation", default=1, min=1, max=256, tooltip="Batches accumulated per optimizer step. Raises the effective batch without more VRAM."),
                 io.String.Input("resolution", default="512", tooltip="Training area is resolution x resolution pixels. A comma separated list like 512,768,1024 trains all of them: each image is assigned to one of the resolutions. "
                                 "512 is comfortable on 8 GB, 768+ needs more VRAM or a larger reserve offload, and buckets far above 512 make steps several times more expensive."),
                 io.Boolean.Input("bucketing", default=True, tooltip="Aspect ratio buckets with the same pixel area. Off center-crops everything to a square."),
-                io.Combo.Input("optimizer", options=["AdamW", "Muon", "Prodigy", "Adafactor", "SGD"], default="AdamW",
+                io.Combo.Input("optimizer", options=["AdamW", "Muon", "Prodigy", "Adafactor", "SGD"], default="Muon",
                                tooltip="Muon orthogonalises each update of the LoRA matrices, its step is scaled to AdamW's so the same learning rates apply. It trains LoRA, LoHa and LoKr, not OFT. "
                                        "Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0 and the constant scheduler. "
                                        "Its initial step estimate is raised to 1e-4, the library default 1e-6 stalls and barely learns."),
-                io.Combo.Input("lr_scheduler", options=["constant", "cosine", "linear"], default="constant"),
-                io.Int.Input("warmup_steps", default=50, min=0, max=100000),
+                io.Combo.Input("lr_scheduler", options=["constant", "cosine", "linear"], default="cosine"),
+                io.Int.Input("warmup_steps", default=100, min=0, max=100000),
                 io.Float.Input("weight_decay", default=0.01, min=0.0, max=1.0, step=0.001),
                 io.Float.Input("max_grad_norm", default=1.0, min=0.0, max=100.0, step=0.1, tooltip="Gradient clipping, 0 disables."),
                 io.Float.Input("caption_dropout", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Chance to train a sample with the empty prompt."),
@@ -95,7 +100,7 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Int.Input("log_every", default=10, min=1, max=10000, tooltip="Console log interval in steps."),
                 io.Int.Input("seed", default=42, min=0, max=0xFFFFFFFFFFFFFFFF),
                 io.String.Input("cache_dir", default="", tooltip="Where latents and text encodings are cached. Empty uses a .moss_cache folder inside each dataset folder."),
-                io.Int.Input("validation_every", default=100, min=0, max=1000000,
+                io.Int.Input("validation_every", default=250, min=0, max=1000000,
                              tooltip="Log a validation loss on up to 4 dataset images at fixed noise levels and noise every N steps, a much steadier progress signal than the training loss. 0 disables."),
                 io.Boolean.Input("compile", default=True,
                                  tooltip="torch.compile the transformer blocks: about 25% faster and about 1 GB less VRAM, the first step takes about a minute longer. Needs triton (triton-windows on Windows), skipped with a warning when it is missing."),
@@ -110,13 +115,13 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                                      "0 only samples on the 'sample now' button."),
                 io.String.Input("preview_prompt", multiline=True, default="", tooltip="Prompt of the previews, empty uses the first training caption. Encoded when the run starts."),
                 io.String.Input("preview_negative", multiline=True, default="", tooltip="Negative prompt of the previews, only used with a cfg other than 1. Encoded when the run starts."),
-                io.Int.Input("preview_width", default=512, min=64, max=4096, step=16),
-                io.Int.Input("preview_height", default=512, min=64, max=4096, step=16),
-                io.Int.Input("preview_steps", default=20, min=1, max=1000, tooltip="An 8-step distilled LoRA needs 8 here and cfg 1."),
-                io.Float.Input("preview_cfg", default=4.0, min=0.0, max=100.0, step=0.1, round=0.01, tooltip="1 skips the negative prompt and takes half the time per step."),
+                io.Int.Input("preview_width", default=1024, min=64, max=4096, step=16),
+                io.Int.Input("preview_height", default=1024, min=64, max=4096, step=16),
+                io.Int.Input("preview_steps", default=8, min=1, max=1000, tooltip="8 with cfg 1 suits an 8-step distilled LoRA, without one use about 20 and cfg 4."),
+                io.Float.Input("preview_cfg", default=1.0, min=0.0, max=100.0, step=0.1, round=0.01, tooltip="1 skips the negative prompt and takes half the time per step."),
                 io.Combo.Input("preview_sampler", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
-                io.Combo.Input("preview_scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="simple"),
-                io.Combo.Input("preview_lora", options=["None"] + folder_paths.get_filename_list("loras"), default="None",
+                io.Combo.Input("preview_scheduler", options=schedulers, default="radiance_shift" if "radiance_shift" in schedulers else "simple"),
+                io.Combo.Input("preview_lora", options=loras, default=DISTILLED_LORA if DISTILLED_LORA in loras else "None",
                                tooltip="LoRA applied on top of the one in training, for the previews only, e.g. a distilled LoRA for fast sampling. It does not affect training or the saved LoRA."),
                 io.Float.Input("preview_lora_strength", default=1.0, min=-100.0, max=100.0, step=0.01),
             ],
