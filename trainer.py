@@ -34,7 +34,8 @@ TARGET_PRESETS = {
 }
 
 # settings a resumed run may change, the rest must match the saved run
-RESUME_FREE = {"steps", "seed", "save_every", "log_every", "validation_every", "vram_reserve_gb", "compile", "gradient_checkpointing"}
+RESUME_FREE = {"steps", "seed", "save_every", "log_every", "validation_every", "vram_reserve_gb", "compile", "gradient_checkpointing",
+               "d0", "d_coef", "prodigy_steps", "schedulefree_c", "timestep_every"}
 
 # preview settings from the node's sample button, picked up between training steps
 sample_requests = []
@@ -193,7 +194,7 @@ def sample_image(mp, preview, seed):
         return preview["vae"].decode(samples)[0]
 
 
-def make_optimizer(name, params, lr, weight_decay, device):
+def make_optimizer(name, params, lr, weight_decay, device, d0=1e-4, d_coef=1.0, prodigy_steps=0, schedulefree_c=0):
     if name == "AdamW":
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=device.type == "cuda")
     if name == "Muon":
@@ -203,7 +204,7 @@ def make_optimizer(name, params, lr, weight_decay, device):
         # the library default d0=1e-6 never takes off here: with one random sigma and noise per batch the
         # per-step gradient aligns with the accumulated weights too little for d to grow, so the run trains
         # d0 times too slowly. 1e-4 picks up like AdamW at 3e-4 with batch_size 2.
-        return ProdigyPlusScheduleFree(params, lr=lr, weight_decay=weight_decay, d0=1e-4)
+        return ProdigyPlusScheduleFree(params, lr=lr, weight_decay=weight_decay, d0=d0, d_coef=d_coef, prodigy_steps=prodigy_steps, schedulefree_c=schedulefree_c)
     if name == "Adafactor":
         return torch.optim.Adafactor(params, lr=lr, weight_decay=weight_decay)
     if name == "SGD":
@@ -378,6 +379,12 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
 
     steps = cfg["steps"]
     schedule_free = cfg["optimizer"] == "Prodigy"
+    sigma_block = {"index": None, "value": None}
+    # a slice of the last step's gradients, to measure how much the gradient direction carries over
+    grad_dirs = None
+    grad_cos = None
+    # the parameters the diagnostic samples, the largest ones carry most of the gradient
+    sample_params = sorted(params, key=lambda p: p.numel(), reverse=True)[:64]
     metadata = {"ss_base_model_version": "moss_image", "ss_network_module": cfg["algorithm"], "ss_network_dim": cfg["rank"],
                 "ss_network_alpha": cfg["alpha"], "ez_moss_config": json.dumps(cfg)}
     loss_history = state["loss"] if state is not None else []
@@ -412,16 +419,35 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
         for name, m in streamed.items():
             recompute_in_backward(m, [p for p in adapters[name].parameters() if p.requires_grad] if name in adapters else [])
         blocks += streamed.values()
-        optimizer = make_optimizer(cfg["optimizer"], params, cfg["learning_rate"], cfg["weight_decay"], device)
+        optimizer = make_optimizer(cfg["optimizer"], params, cfg["learning_rate"], cfg["weight_decay"], device,
+                                   cfg["d0"], cfg["d_coef"], cfg["prodigy_steps"], cfg["schedulefree_c"])
         if state is not None:
             optimizer.load_state_dict(state["optimizer"])
-            if cfg["optimizer"] == "Prodigy":
-                # states written before the d0 bump carry the estimate Prodigy stalled on; Prodigy only
-                # ever raises d, so without this a resumed run trains at the saved one forever
+            if schedule_free:
+                # states written before the d0 knob carry the estimate Prodigy stalled on; Prodigy only
+                # ever raises d, so a raised d0 must lift d with it
+                frozen = next((group["prodigy_steps"] for group in optimizer.param_groups if group["prodigy_steps"]), 0)
                 for group in optimizer.param_groups:
-                    group["d0"] = 1e-4
+                    group["d0"] = cfg["d0"]
                     if group["d"] < group["d0"]:
                         group["d"] = group["d0"]
+                    group["d_coef"] = cfg["d_coef"]
+                    group["schedulefree_c"] = cfg["schedulefree_c"]
+                    # a frozen run freed the p0/s state, so the freeze point cannot move after the fact
+                    group["prodigy_steps"] = frozen if frozen else cfg["prodigy_steps"]
+                if frozen and frozen != cfg["prodigy_steps"]:
+                    logging.warning(f"[MOSS Trainer] Prodigy's step size froze at step {frozen} in the saved run and cannot change on resume, keeping {frozen}")
+        if schedule_free:
+            logging.info(f"[MOSS Trainer] Prodigy: d0 {cfg['d0']:.1e}, d_coef {cfg['d_coef']}, prodigy_steps {cfg['prodigy_steps']}, schedulefree_c {cfg['schedulefree_c']}, "
+                         f"scheduler {cfg['lr_scheduler']}, warmup {cfg['warmup_steps']}, clip {cfg['max_grad_norm']}, timestep_every {cfg['timestep_every']}")
+            issues = []
+            if cfg["lr_scheduler"] != "constant":
+                issues.append(f"lr_scheduler {cfg['lr_scheduler']}")
+            if cfg["max_grad_norm"] > 0:
+                issues.append(f"max_grad_norm {cfg['max_grad_norm']}")
+            if issues:
+                # a schedule shrinks the distance Prodigy's d estimate measures, clipping rescales the gradients it reads
+                logging.warning("[MOSS Trainer] Prodigy wants the constant scheduler and max_grad_norm 0, these bias its step-size estimate low: " + ", ".join(issues))
         # a loaded optimizer keeps initial_lr, so the schedule picks up at start_step
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(cfg["lr_scheduler"], cfg["warmup_steps"], steps), last_epoch=start_step - 1)
         comfy.model_management.in_training = True
@@ -441,6 +467,17 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
         def accumulate():
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
+            held = None
+            if cfg["timestep_every"] > 1:
+                # one noise level for several steps: the gradient direction stays consistent, which is what
+                # Prodigy's step-size estimate measures. Seeded from the step index, so a replayed step
+                # and a resumed run draw the same level again
+                block = step // cfg["timestep_every"]
+                if sigma_block["index"] != block:
+                    gen = torch.Generator(device=device).manual_seed((cfg["seed"] + block * 0x9E3779B1) & 0x7FFFFFFFFFFFFFFF)
+                    sigma_block["value"] = sample_sigmas(1, cfg["timestep_distribution"], cfg["timestep_shift"], gen, device)
+                    sigma_block["index"] = block
+                held = sigma_block["value"]
             for _ in range(cfg["grad_accumulation"]):
                 batch = sampler.next()
                 # MOSS has no text mask, rope follows the true length: run each caption length as its own forward
@@ -452,7 +489,7 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
                     x0 = torch.stack([items[i]["latent"] for i, _ in group]).to(device, torch.float32)
                     context = torch.stack([c for _, c in group]).to(device, dtype)
                     noise = torch.randn(x0.shape, generator=generator, device=device)
-                    sigma = sample_sigmas(len(group), cfg["timestep_distribution"], cfg["timestep_shift"], generator, device)
+                    sigma = held.repeat(len(group)) if held is not None else sample_sigmas(len(group), cfg["timestep_distribution"], cfg["timestep_shift"], generator, device)
                     s = sigma.view(-1, 1, 1, 1)
                     pred = predict((1 - s) * x0 + s * noise, sigma, context)
                     loss = torch.nn.functional.mse_loss(pred.float(), noise - x0)
@@ -489,6 +526,15 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
             else:
                 grad_norm = math.sqrt(sum(p.grad.float().pow(2).sum().item() for p in params if p.grad is not None))
             lr = scheduler.get_last_lr()[0]
+            if schedule_free:
+                # how much of the gradient direction carries over into the next step, the signal Prodigy estimates from.
+                # one dot product over all the gradients, the same sum Prodigy projects the weight displacement onto
+                with torch.no_grad():
+                    # evenly spread over the whole tensor, a slice of one column says nothing about the direction
+                    current = torch.cat([p.grad.detach().flatten()[::max(1, p.grad.numel() // 1024)][:1024] for p in sample_params if p.grad is not None])
+                    if grad_dirs is not None and current.numel() == grad_dirs.numel():
+                        grad_cos = (current @ grad_dirs / (current.norm() * grad_dirs.norm()).clamp_min(1e-12)).item()
+                    grad_dirs = current
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -502,7 +548,16 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
                 vram = torch.cuda.max_memory_allocated(device) / 1024 ** 3 if torch.cuda.is_available() else 0.0
                 # the paging blobs of dynamic VRAM sit outside the allocator, so report what CUDA sees too
                 free = torch.cuda.mem_get_info(device)[0] / 1024 ** 3 if torch.cuda.is_available() else 1.0
-                logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr:.2e} | grad norm {grad_norm:.3f} | "
+                if schedule_free:
+                    group = optimizer.param_groups[0]
+                    d = group["d"]
+                    # the raw estimate d is compared against, it grows with the gradient alignment and has to pass d0 before d moves
+                    d_hat = group["d_numerator"] / group["d_denom"] if group["d_denom"] else 0.0
+                    lr_text = f"{lr:.2e} (d {d:.3e}, d_hat {d_hat:.3e}, d*lr {d * lr:.2e})"
+                else:
+                    lr_text = f"{lr:.2e}"
+                cos_text = f"grad cos {grad_cos:+.3f} | " if schedule_free and grad_cos is not None else ""
+                logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr_text} | grad norm {grad_norm:.3f} | {cos_text}"
                              f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB | device free {free:.2f} GB")
             evaluate = cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps)
             save = cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps

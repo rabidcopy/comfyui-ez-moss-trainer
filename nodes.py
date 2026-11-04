@@ -83,8 +83,16 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Boolean.Input("bucketing", default=True, tooltip="Aspect ratio buckets with the same pixel area. Off center-crops everything to a square."),
                 io.Combo.Input("optimizer", options=["AdamW", "Muon", "Prodigy", "Adafactor", "SGD"], default="Muon",
                                tooltip="Muon orthogonalises each update of the LoRA matrices, its step is scaled to AdamW's so the same learning rates apply. It trains LoRA, LoHa and LoKr, not OFT. "
-                                       "Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0 and the constant scheduler. "
-                                       "Its initial step estimate is raised to 1e-4, the library default 1e-6 stalls and barely learns."),
+                                       "Prodigy is Prodigy + schedule-free (prodigy-plus-schedule-free): it finds the step size itself, use learning_rate 1.0, the constant scheduler and max_grad_norm 0. "
+                                       "Its estimate is fed by how well the gradient lines up with the weight displacement, so with a fresh sigma per step it can sit on its d0 floor for a while before it starts moving. Watch d in the console log."),
+                io.Float.Input("d0", default=1e-4, min=1e-8, max=1.0, step=1e-8, round=False,
+                               tooltip="Prodigy only: its first step-size estimate, and its floor, since d only grows from here. The library default 1e-6 stalls and barely learns here, 1e-4 picks up like AdamW at 3e-4 with batch_size 2."),
+                io.Float.Input("d_coef", default=1.0, min=0.01, max=10.0, step=0.05, round=False,
+                               tooltip="Prodigy only: multiplier on the estimated step size, the library's preferred tuning knob. Above 1 pushes the step size up sooner, below 1 for stability."),
+                io.Int.Input("prodigy_steps", default=0, min=0, max=100000,
+                             tooltip="Prodigy only: freeze the step-size estimate after N steps and free its memory. Stops the found step size from drifting late in a run, 0 keeps adapting."),
+                io.Float.Input("schedulefree_c", default=0.0, min=0.0, max=200.0, step=1.0,
+                               tooltip="Prodigy only: averaging strength of the schedule-free point that gets saved. 0 follows the library rule; short runs with small batches, this trainer's usual case, benefit from 6-12."),
                 io.Combo.Input("lr_scheduler", options=["constant", "cosine", "linear"], default="cosine"),
                 io.Int.Input("warmup_steps", default=100, min=0, max=100000),
                 io.Float.Input("weight_decay", default=0.01, min=0.0, max=1.0, step=0.001),
@@ -92,6 +100,9 @@ class EZMOSSTrainLoRA(io.ComfyNode):
                 io.Float.Input("caption_dropout", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Chance to train a sample with the empty prompt."),
                 io.Combo.Input("timestep_distribution", options=["logit_normal", "uniform"], default="logit_normal"),
                 io.Float.Input("timestep_shift", default=1.0, min=0.1, max=20.0, step=0.1, tooltip="Shifts training noise levels towards high noise (>1) like the sampling shift. 1.0 matches OneTrainer."),
+                io.Int.Input("timestep_every", default=1, min=1, max=100000,
+                             tooltip="Steps that share the same noise level. 1 draws a new level every step. Holding it for several steps keeps the gradient direction consistent, "
+                                     "which Prodigy's step-size estimate needs to find a step size, at the cost of a coarser noise-level curriculum."),
                 io.Boolean.Input("gradient_checkpointing", default=True, tooltip="Recompute block activations in the backward pass. Needed for 6-8 GB."),
                 io.Float.Input("vram_reserve_gb", default=2.5, min=0.0, max=64.0, step=0.25,
                                tooltip="Legacy model loading only (ComfyUI started without dynamic VRAM): VRAM kept free for activations and gradients, weights that do not fit in the rest are streamed from RAM. Dynamic VRAM pages weights by itself and ignores this."),
@@ -135,8 +146,8 @@ class EZMOSSTrainLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, clip, vae, dataset_paths, output_name, algorithm, rank, alpha, target_layers, steps, learning_rate, batch_size, grad_accumulation,
-                resolution, bucketing, optimizer, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
-                gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile,
+                resolution, bucketing, optimizer, d0, d_coef, prodigy_steps, schedulefree_c, lr_scheduler, warmup_steps, weight_decay, max_grad_norm, caption_dropout, timestep_distribution, timestep_shift,
+                timestep_every, gradient_checkpointing, vram_reserve_gb, save_every, save_dtype, log_every, seed, cache_dir, validation_every, compile,
                 text_batch, resume, preview_every, preview_prompt, preview_negative, preview_width, preview_height, preview_steps, preview_cfg, preview_sampler,
                 preview_scheduler, preview_lora, preview_lora_strength) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.MOSSImage):
@@ -167,9 +178,10 @@ class EZMOSSTrainLoRA(io.ComfyNode):
             comfy.model_management.unload_model_and_clones(vae.patcher)
             cfg = {"algorithm": algorithm, "rank": rank, "alpha": alpha, "target": target_layers, "steps": steps, "learning_rate": learning_rate,
                    "batch_size": batch_size, "grad_accumulation": grad_accumulation, "resolution": resolution, "bucketing": bucketing,
-                   "optimizer": optimizer, "lr_scheduler": lr_scheduler, "warmup_steps": warmup_steps, "weight_decay": weight_decay,
+                   "optimizer": optimizer, "d0": d0, "d_coef": d_coef, "prodigy_steps": prodigy_steps, "schedulefree_c": schedulefree_c,
+                   "lr_scheduler": lr_scheduler, "warmup_steps": warmup_steps, "weight_decay": weight_decay,
                    "max_grad_norm": max_grad_norm, "caption_dropout": caption_dropout, "timestep_distribution": timestep_distribution,
-                   "timestep_shift": timestep_shift, "gradient_checkpointing": gradient_checkpointing, "vram_reserve_gb": vram_reserve_gb,
+                   "timestep_shift": timestep_shift, "timestep_every": timestep_every, "gradient_checkpointing": gradient_checkpointing, "vram_reserve_gb": vram_reserve_gb,
                    "save_every": save_every, "save_dtype": save_dtype, "log_every": log_every, "seed": seed, "validation_every": validation_every, "compile": compile}
             preview = {"every": preview_every, "width": preview_width, "height": preview_height, "steps": preview_steps, "cfg": preview_cfg, "sampler": preview_sampler, "scheduler": preview_scheduler,
                        "lora": preview_lora, "lora_strength": preview_lora_strength, "positive": positive, "negative": negative, "vae": vae, "show": show_preview}
