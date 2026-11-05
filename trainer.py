@@ -367,7 +367,7 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
     def show_preview(step):
         begin = time.perf_counter()
         try:
-            preview["show"](sample_image(mp, preview, cfg["seed"]), step, f"{save_path}_{step:06d}_preview.png")
+            preview["show"](sample_image(mp, preview, cfg["seed"]), step, preview["dir"])
             logging.info(f"[MOSS Trainer] preview at step {step} in {time.perf_counter() - begin:.1f} s, {preview['width']}x{preview['height']}, {preview['steps']} steps, cfg {preview['cfg']}, "
                          f"{preview['sampler']}/{preview['scheduler']}" + (f", {preview['lora']}" if preview["lora"] != "None" else ""))
         except torch.OutOfMemoryError:
@@ -391,6 +391,14 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
     validation = state["validation"] if state is not None else []
     validation_steps = state["validation_steps"] if state is not None else []
     ema = state["ema"] if state is not None else None
+    sent_losses = 0
+
+    def report(step):
+        # the node's loss graph updates at every log interval, validation can fall between two logs
+        nonlocal sent_losses
+        preview["report"](step, loss_history[sent_losses:], ema, validation, validation_steps)
+        sent_losses = len(loss_history)
+
     pbar = comfy.utils.ProgressBar(steps)
     pbar.update_absolute(start_step)
     logging.info(f"[MOSS Trainer] {len(items)} images, {len(sampler)} batches per epoch, {steps} steps x {cfg['grad_accumulation']} accumulation, batch {cfg['batch_size']}")
@@ -456,6 +464,7 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
             if not validation:
                 validate(start_step)
                 logging.info(f"[MOSS Trainer] validation loss {validation[0]:.4f} before training ({len(val_images)} images x {len(VALIDATION_SIGMAS)} noise levels)")
+                report(start_step)
             val_start = validation[0]
         sample_requests.clear()
         if preview["every"] > 0 and start_step == 0:
@@ -559,6 +568,7 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
                 cos_text = f"grad cos {grad_cos:+.3f} | " if schedule_free and grad_cos is not None else ""
                 logging.info(f"[MOSS Trainer] step {step + 1}/{steps} | epoch {sampler.epoch} | loss {step_loss:.4f} (avg {ema:.4f}) | lr {lr_text} | grad norm {grad_norm:.3f} | {cos_text}"
                              f"{per_step:.2f} s/step | elapsed {_fmt_time(now - start)} | ETA {_fmt_time(per_step * (steps - step - 1))} | peak VRAM {vram:.2f} GB | device free {free:.2f} GB")
+                report(step + 1)
             evaluate = cfg["validation_every"] > 0 and ((step + 1) % cfg["validation_every"] == 0 or step + 1 == steps)
             save = cfg["save_every"] > 0 and (step + 1) % cfg["save_every"] == 0 and step + 1 < steps
             show = preview["every"] > 0 and ((step + 1) % preview["every"] == 0 or step + 1 == steps)
@@ -572,6 +582,7 @@ def train(mp, items, empty_cond, cfg, save_path, preview, resume=False):
             if evaluate:
                 validate(step + 1)
                 logging.info(f"[MOSS Trainer] validation loss {validation[-1]:.4f} at step {step + 1} ({(validation[-1] / val_start - 1) * 100:+.1f}% since start)")
+                report(step + 1)
             if save:
                 save_lora(state_dict(), f"{save_path}_{step + 1:06d}.safetensors", {**metadata, "ss_steps": step + 1})
                 save_state(step + 1)

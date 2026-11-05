@@ -91,7 +91,9 @@ A steady decline means the LoRA is learning the dataset. A large drop late in th
 
 ### Previews
 
-The trainer samples one image with the LoRA in training before the run, every `preview_every` steps (default 250, 0 disables) and at the end. It shows on the node and is saved as `<output_name>_<step>_preview.png` next to the LoRA. The seed stays fixed, so the previews of a run are comparable.
+The trainer samples one image with the LoRA in training before the run, every `preview_every` steps (default 250, 0 disables) and at the end. It shows on the node and is saved as `preview_<step>.png` in `.samples/<output_name>` inside the first dataset folder, next to its `.moss_cache`. The arrows under the preview flip through the folder's earlier previews, across queues and reloads. The seed stays fixed, so the previews of a run are comparable.
+
+Each `log_every` report also updates the node's live loss graph: training loss as a line, the validation points as yellow markers on the same scale.
 
 An empty `preview_prompt` uses the first training caption. `preview_prompt` and `preview_negative` are encoded when the run starts, because the text encoder is not loaded during training. Size, steps, cfg, sampler and scheduler work like a KSampler.
 
